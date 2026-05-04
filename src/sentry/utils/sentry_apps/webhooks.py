@@ -140,14 +140,21 @@ def _notify_webhook_disabled(
         return
     owner_org = owner_context.organization
 
-    if not set_dedup_key(sentry_app, circuit_breaker):
-        return
+    dry_run = options.get("sentry-apps.webhook.circuit-breaker.dry-run") and not features.has(
+        "organizations:sentry-app-webhook-circuit-breaker-live-run",
+        owner_org,
+    )
 
-    if options.get("sentry-apps.webhook.circuit-breaker.dry-run"):
+    if dry_run:
+        if not set_dedup_key(sentry_app, circuit_breaker):
+            return
         logger.info(
             "sentry_app.webhook.circuit_breaker.would_email",
             extra={"slug": sentry_app.slug},
         )
+        return
+
+    if not set_dedup_key(sentry_app, circuit_breaker):
         return
 
     data = SentryAppWebhookDisabled(
@@ -178,11 +185,18 @@ def _circuit_breaker_allows_request(
     sentry_app: SentryApp | RpcSentryApp,
     org_id: int,
     lifecycle: EventLifecycle,
+    owner_context: RpcUserOrganizationContext | None,
 ) -> bool:
     if circuit_breaker is None or circuit_breaker.should_allow_request():
         return True
 
-    dry_run = options.get("sentry-apps.webhook.circuit-breaker.dry-run")
+    dry_run = options.get("sentry-apps.webhook.circuit-breaker.dry-run") and not (
+        owner_context is not None
+        and features.has(
+            "organizations:sentry-app-webhook-circuit-breaker-live-run",
+            owner_context.organization,
+        )
+    )
     if dry_run:
         metrics.incr(
             "sentry_app.webhook.circuit_breaker.would_block",
@@ -281,7 +295,9 @@ def send_and_save_webhook_request(
                 include_teams=False,
             )
             circuit_breaker = _create_circuit_breaker(sentry_app, owner_context)
-            if not _circuit_breaker_allows_request(circuit_breaker, sentry_app, org_id, lifecycle):
+            if not _circuit_breaker_allows_request(
+                circuit_breaker, sentry_app, org_id, lifecycle, owner_context
+            ):
                 return Response()
 
             with circuit_breaker_tracking(circuit_breaker):

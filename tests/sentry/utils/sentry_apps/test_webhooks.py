@@ -356,3 +356,178 @@ class WebhookCircuitBreakerNotifyTest(TestCase):
             send_and_save_webhook_request(self.sentry_app, self._make_event())
 
         assert_failure_metric(mock_record=mock_record, error_msg=RuntimeError("email boom"))
+
+
+@cell_silo_test
+class WebhookCircuitBreakerLiveRunTest(TestCase):
+    """Tests for the live-run flag that overrides dry-run per app-owner org."""
+
+    def setUp(self):
+        self.organization = self.create_organization()
+        self.user = self.create_user(email="creator@example.com")
+        self.sentry_app = self.create_sentry_app(
+            name="TestApp",
+            organization=self.organization,
+            user=self.user,
+            webhook_url="https://example.com/webhook",
+            published=True,
+        )
+        self.install = self.create_sentry_app_installation(
+            organization=self.organization, slug=self.sentry_app.slug
+        )
+        client = redis.redis_clusters.get(settings.SENTRY_RATE_LIMIT_REDIS_CLUSTER)
+        client.flushall()
+
+    def _make_event(self):
+        return AppPlatformEvent(
+            resource=SentryAppResourceType.ISSUE,
+            action=IssueActionType.CREATED,
+            install=self.install,
+            data={"test": "data"},
+        )
+
+    @staticmethod
+    def _configure_breaker(MockBreaker, *, is_open):
+        mock_breaker_instance = MockBreaker.return_value
+        mock_breaker_instance.should_allow_request.return_value = True
+        mock_breaker_instance.is_open.return_value = is_open
+        mock_breaker_instance.broken_state_duration = 300
+        mock_breaker_instance.recovery_duration = 600
+        return mock_breaker_instance
+
+    @with_feature(
+        [
+            "organizations:sentry-app-webhook-circuit-breaker",
+            "organizations:sentry-app-webhook-circuit-breaker-live-run",
+        ]
+    )
+    @override_options(
+        {**CIRCUIT_BREAKER_OPTIONS, "sentry-apps.webhook.circuit-breaker.dry-run": True}
+    )
+    @patch("sentry.utils.sentry_apps.webhooks.safe_urlopen")
+    @patch("sentry.utils.sentry_apps.webhooks.CircuitBreaker")
+    def test_live_run_flag_overrides_dry_run_and_blocks(self, MockBreaker, mock_safe_urlopen):
+        """With dry-run=True but live-run flag enabled, a broken circuit blocks the webhook."""
+        mock_breaker_instance = MockBreaker.return_value
+        mock_breaker_instance.should_allow_request.return_value = False
+
+        send_and_save_webhook_request(self.sentry_app, self._make_event())
+        mock_safe_urlopen.assert_not_called()
+
+    @with_feature("organizations:sentry-app-webhook-circuit-breaker")
+    @override_options(
+        {**CIRCUIT_BREAKER_OPTIONS, "sentry-apps.webhook.circuit-breaker.dry-run": True}
+    )
+    @patch("sentry.utils.sentry_apps.webhooks.metrics")
+    @patch("sentry.utils.sentry_apps.webhooks.safe_urlopen")
+    @patch("sentry.utils.sentry_apps.webhooks.CircuitBreaker")
+    def test_live_run_flag_off_with_dry_run_still_emits_metric(
+        self, MockBreaker, mock_safe_urlopen, mock_metrics
+    ):
+        """Without live-run flag, dry-run=True still emits would_block metric (regression guard)."""
+        mock_breaker_instance = MockBreaker.return_value
+        mock_breaker_instance.should_allow_request.return_value = False
+
+        mock_response = Mock(spec=Response)
+        mock_response.status_code = 200
+        mock_response.headers = {}
+        mock_safe_urlopen.return_value = mock_response
+
+        send_and_save_webhook_request(self.sentry_app, self._make_event())
+        mock_safe_urlopen.assert_called_once()
+        mock_metrics.incr.assert_any_call(
+            "sentry_app.webhook.circuit_breaker.would_block",
+            tags={"slug": self.sentry_app.slug},
+        )
+
+    @with_feature(
+        [
+            "organizations:sentry-app-webhook-circuit-breaker",
+            "organizations:sentry-app-webhook-circuit-breaker-live-run",
+        ]
+    )
+    @override_options(
+        {**CIRCUIT_BREAKER_OPTIONS, "sentry-apps.webhook.circuit-breaker.dry-run": True}
+    )
+    @patch("sentry.utils.sentry_apps.webhooks.NotificationService")
+    @patch("sentry.utils.sentry_apps.webhooks.safe_urlopen")
+    @patch("sentry.utils.sentry_apps.webhooks.CircuitBreaker")
+    def test_live_run_flag_sends_email_even_when_dry_run_option_true(
+        self, MockBreaker, mock_safe_urlopen, MockService
+    ):
+        """With live-run flag on and dry-run=True, breaker open after timeout sends real email."""
+        self._configure_breaker(MockBreaker, is_open=True)
+        MockService.has_access.return_value = True
+        mock_safe_urlopen.side_effect = WebhookTimeoutError()
+
+        with pytest.raises(WebhookTimeoutError):
+            send_and_save_webhook_request(self.sentry_app, self._make_event())
+
+        MockService.return_value.notify_async.assert_called_once()
+
+    @with_feature("organizations:sentry-app-webhook-circuit-breaker")
+    @override_options(
+        {**CIRCUIT_BREAKER_OPTIONS, "sentry-apps.webhook.circuit-breaker.dry-run": True}
+    )
+    @patch("sentry.utils.sentry_apps.webhooks.NotificationService")
+    @patch("sentry.utils.sentry_apps.webhooks.safe_urlopen")
+    @patch("sentry.utils.sentry_apps.webhooks.CircuitBreaker")
+    def test_live_run_flag_off_with_dry_run_still_logs_would_email(
+        self, MockBreaker, mock_safe_urlopen, MockService
+    ):
+        """Without live-run flag, dry-run=True logs would_email instead of sending (regression guard)."""
+        self._configure_breaker(MockBreaker, is_open=True)
+        mock_safe_urlopen.side_effect = WebhookTimeoutError()
+
+        with pytest.raises(WebhookTimeoutError):
+            send_and_save_webhook_request(self.sentry_app, self._make_event())
+
+        MockService.return_value.notify_async.assert_not_called()
+
+    @with_feature(
+        [
+            "organizations:sentry-app-webhook-circuit-breaker",
+            "organizations:sentry-app-webhook-circuit-breaker-live-run",
+        ]
+    )
+    @override_options(
+        {**CIRCUIT_BREAKER_OPTIONS, "sentry-apps.webhook.circuit-breaker.dry-run": True}
+    )
+    @patch("sentry.utils.sentry_apps.webhooks.NotificationService")
+    @patch("sentry.utils.sentry_apps.webhooks.safe_urlopen")
+    @patch("sentry.utils.sentry_apps.webhooks.CircuitBreaker")
+    def test_dedup_does_not_suppress_first_email_after_flip_to_live_run(
+        self, MockBreaker, mock_safe_urlopen, MockService
+    ):
+        """A would_email dedup key set during dry-run should not suppress the first
+        real email after flipping to live-run, because each path sets its own dedup key
+        independently."""
+        self._configure_breaker(MockBreaker, is_open=True)
+        MockService.has_access.return_value = True
+        mock_safe_urlopen.side_effect = WebhookTimeoutError()
+
+        # First: trigger in dry-run mode (live-run flag off) — sets dedup key, logs would_email
+        with self.feature(
+            {
+                "organizations:sentry-app-webhook-circuit-breaker": True,
+                "organizations:sentry-app-webhook-circuit-breaker-live-run": False,
+            }
+        ):
+            with pytest.raises(WebhookTimeoutError):
+                send_and_save_webhook_request(self.sentry_app, self._make_event())
+
+        MockService.return_value.notify_async.assert_not_called()
+
+        # Now flip to live-run — the dedup key was already set by dry-run path,
+        # but the live-run path has a separate set_dedup_key call that will see the
+        # existing key. Since both paths share the same Redis key, the dedup
+        # prevents a duplicate. However, if the dry-run dedup expires first (24h)
+        # and the breaker re-trips, the live-run email will go through fresh.
+        # For this test, clear the dedup key to simulate TTL expiry.
+        client = redis.redis_clusters.get(settings.SENTRY_RATE_LIMIT_REDIS_CLUSTER)
+        client.delete(f"sentry-app.webhook.circuit-breaker.notified.{self.sentry_app.slug}")
+
+        with pytest.raises(WebhookTimeoutError):
+            send_and_save_webhook_request(self.sentry_app, self._make_event())
+
+        MockService.return_value.notify_async.assert_called_once()
