@@ -715,7 +715,7 @@ def update_seer_project_settings(project: Project, data: dict[str, Any]) -> None
     """Apply high-level Seer settings to a project.
     Expects: agent, integrationId, stoppingPoint, scannerAutomation, nightshiftTweaks."""
 
-    def _set(key: str, value: Any, default: Any) -> None:
+    def _set_if_not_default(key: str, value: Any, default: Any) -> None:
         """If we're trying to set a default, delete the option. Otherwise, set it."""
         if value == default:
             project.delete_option(key)
@@ -746,7 +746,7 @@ def update_seer_project_settings(project: Project, data: dict[str, Any]) -> None
 
             # Check stopping point to see if we can auto create PRs.
             if stopping_point is not None:
-                _set(
+                _set_if_not_default(
                     "sentry:seer_automation_handoff_auto_create_pr",
                     stopping_point == "open_pr",
                     default=False,
@@ -754,28 +754,30 @@ def update_seer_project_settings(project: Project, data: dict[str, Any]) -> None
 
     if stopping_point is not None:
         if stopping_point == "off":
-            _set(
+            _set_if_not_default(
                 "sentry:autofix_automation_tuning",
                 AutofixAutomationTuningSettings.OFF,
                 default=AUTOFIX_AUTOMATION_TUNING_DEFAULT,
             )
         else:
-            _set(
+            _set_if_not_default(
                 "sentry:autofix_automation_tuning",
                 AutofixAutomationTuningSettings.MEDIUM,
                 default=AUTOFIX_AUTOMATION_TUNING_DEFAULT,
             )
-            _set(
+            _set_if_not_default(
                 "sentry:seer_automated_run_stopping_point",
                 stopping_point,
                 default=SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT,
             )
 
     if "scannerAutomation" in data:
-        _set("sentry:seer_scanner_automation", data["scannerAutomation"], default=True)
+        _set_if_not_default(
+            "sentry:seer_scanner_automation", data["scannerAutomation"], default=True
+        )
 
     if "nightshiftTweaks" in data:
-        _set("sentry:seer_nightshift_tweaks", data["nightshiftTweaks"], default=None)
+        _set_if_not_default("sentry:seer_nightshift_tweaks", data["nightshiftTweaks"], default=None)
 
 
 def has_project_connected_repos(organization: Organization, project: Project) -> bool:

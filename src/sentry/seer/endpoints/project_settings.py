@@ -324,8 +324,8 @@ class OrganizationSeerProjectSettingsEndpoint(OrganizationEndpoint):
         if order_by is None:
             return Response({"detail": f"Invalid sortBy: {sort_by}"}, status=400)
 
-        queryset = Project.objects.filter(organization_id=organization.id).annotate(
-            # Annotate repos_count in case we're sorting by it.
+        projects = self.get_projects(request, organization)
+        queryset = Project.objects.filter(id__in={p.id for p in projects}).annotate(
             repos_count=Count(
                 "seerprojectrepository",
                 filter=Q(seerprojectrepository__repository__status=ObjectStatus.ACTIVE),
@@ -361,7 +361,8 @@ class OrganizationSeerProjectSettingsEndpoint(OrganizationEndpoint):
         data = serializer.validated_data
         search_query = data.pop("query")
 
-        queryset = Project.objects.filter(organization_id=organization.id).annotate(
+        allowed_projects = self.get_projects(request, organization)
+        queryset = Project.objects.filter(id__in={p.id for p in allowed_projects}).annotate(
             repos_count=Count(
                 "seerprojectrepository",
                 filter=Q(seerprojectrepository__repository__status=ObjectStatus.ACTIVE),
@@ -375,10 +376,7 @@ class OrganizationSeerProjectSettingsEndpoint(OrganizationEndpoint):
                 return Response({"detail": str(e)}, status=400)
             queryset = _apply_search_filters(queryset, filters)
 
-        projects = list(
-            self.get_projects(request, organization, project_ids={p.id for p in queryset})
-        )
-
+        projects = list(queryset)
         for project in projects:
             update_seer_project_settings(project, data)
 
