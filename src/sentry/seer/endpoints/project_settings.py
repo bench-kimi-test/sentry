@@ -26,6 +26,7 @@ from sentry.constants import (
 )
 from sentry.db.models.fields.jsonfield import LegacyTextJSONField
 from sentry.exceptions import InvalidSearchQuery
+from sentry.integrations.services.integration import integration_service
 from sentry.models.options.project_option import ProjectOption
 from sentry.models.organization import Organization
 from sentry.models.project import Project
@@ -190,7 +191,7 @@ def _annotate_queryset(queryset):
         _handoff_target=_project_option_subquery("sentry:seer_automation_handoff_target"),
         agent=Case(
             # Null/missing handoff target (ie, no configured external handoff) means use Seer agent.
-            When(_handoff_target=None, then=Value(json.dumps("seer"))),
+            When(_handoff_target__isnull=True, then=Value(json.dumps("seer"))),
             # Convert raw handoff targets to their user-facing agent aliases.
             *[
                 When(_handoff_target=target, then=Value(json.dumps(alias)))
@@ -273,6 +274,15 @@ class ProjectSettingsUpdateSerializer(serializers.Serializer):
         organization = self.context["organization"]
         if value not in get_valid_automated_run_stopping_points(organization):
             raise serializers.ValidationError(f'"{value}" is not a valid choice.')
+        return value
+
+    def validate_integrationId(self, value: int) -> int:
+        organization = self.context["organization"]
+        org_integrations = integration_service.get_organization_integrations(
+            organization_id=organization.id, integration_id=value
+        )
+        if not org_integrations:
+            raise serializers.ValidationError(f"{value} is not a valid integration.")
         return value
 
     def validate(self, data):
