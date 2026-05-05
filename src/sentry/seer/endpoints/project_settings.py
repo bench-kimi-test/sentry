@@ -56,6 +56,10 @@ SORT_FIELDS_MAPPING: dict[str, str] = {
     "-name": "-slug",
     "reposCount": "repos_count",
     "-reposCount": "-repos_count",
+    "stoppingPoint": "stopping_point",
+    "-stoppingPoint": "-stopping_point",
+    "agent": "handoff_target",
+    "-agent": "-handoff_target",
 }
 
 search_config = SearchConfig.create_from(
@@ -75,11 +79,10 @@ class SeerProjectSettingsResponse(TypedDict):
     integrationId: str | None
     stoppingPoint: str
     scannerAutomation: bool
-    nightshiftTweaks: dict | None
     reposCount: int
 
 
-def _serialize_project_settings(
+def _serialize_seer_project_settings(
     project: Project, attrs: dict[str, Any]
 ) -> SeerProjectSettingsResponse:
     # Only use the real stopping point if tuning is on.
@@ -106,7 +109,6 @@ def _serialize_project_settings(
         integrationId=integration_id,
         stoppingPoint=stopping_point,
         scannerAutomation=attrs["sentry:seer_scanner_automation"],
-        nightshiftTweaks=attrs["sentry:seer_nightshift_tweaks"],
         reposCount=attrs["repos_count"],
     )
 
@@ -114,6 +116,7 @@ def _serialize_project_settings(
 def _get_attrs_for_projects(
     projects: list[Project],
 ) -> dict[int, dict[str, Any]]:
+    """For each project, construct a dict containing repos_count and the relevant Seer project options."""
     if not projects:
         return {}
 
@@ -161,18 +164,34 @@ def _get_attrs_for_project(project: Project) -> dict[str, Any]:
     return attrs
 
 
-def _apply_search_filters(queryset, filters: Sequence[QueryToken]):
-    """Apply parsed search tokens to a Project queryset.
-
-    All filters must be applied at the DB level so pagination is correct.
-    Supported tokens: id, name, reposCount, stoppingPoint, agent.
-    """
-
+def _annotate_queryset(queryset):
     def _project_option_subquery(key: str) -> Subquery:
         return Subquery(
             ProjectOption.objects.filter(project_id=OuterRef("id"), key=key).values("value")[:1]
         )
 
+    return queryset.annotate(
+        repos_count=Count(
+            "seerprojectrepository",
+            filter=Q(seerprojectrepository__repository__status=ObjectStatus.ACTIVE),
+        ),
+        _tuning=Coalesce(
+            _project_option_subquery("sentry:autofix_automation_tuning"),
+            Value(AUTOFIX_AUTOMATION_TUNING_DEFAULT),
+        ),
+        stopping_point=Case(
+            When(_tuning=AutofixAutomationTuningSettings.OFF, then=Value("off")),
+            default=Coalesce(
+                _project_option_subquery("sentry:seer_automated_run_stopping_point"),
+                Value(SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT),
+            ),
+            output_field=CharField(),
+        ),
+        handoff_target=_project_option_subquery("sentry:seer_automation_handoff_target"),
+    )
+
+
+def _apply_search_filters(queryset, filters: Sequence[QueryToken]):
     for f in filters:
         if not isinstance(f, SearchFilter):
             continue
@@ -198,14 +217,6 @@ def _apply_search_filters(queryset, filters: Sequence[QueryToken]):
                 queryset = queryset.exclude(Q(name__icontains=value) & Q(slug__icontains=value))
 
         elif key == "reposCount":
-            # We could have already annotated repos_count for ordering. Check before we annotate again.
-            if "repos_count" not in queryset.query.annotations:
-                queryset = queryset.annotate(
-                    repos_count=Count(
-                        "seerprojectrepository",
-                        filter=Q(seerprojectrepository__repository__status=ObjectStatus.ACTIVE),
-                    )
-                )
             count = int(value)
             if op == "=":
                 queryset = queryset.filter(repos_count=count)
@@ -221,32 +232,14 @@ def _apply_search_filters(queryset, filters: Sequence[QueryToken]):
                 queryset = queryset.filter(repos_count__lte=count)
 
         elif key == "stoppingPoint":
-            queryset = queryset.annotate(
-                _tuning=Coalesce(
-                    _project_option_subquery("sentry:autofix_automation_tuning"),
-                    Value(AUTOFIX_AUTOMATION_TUNING_DEFAULT),
-                ),
-                stopping_point=Case(
-                    When(_tuning=AutofixAutomationTuningSettings.OFF, then=Value("off")),
-                    default=Coalesce(
-                        _project_option_subquery("sentry:seer_automated_run_stopping_point"),
-                        Value(SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT),
-                    ),
-                    output_field=CharField(),
-                ),
-            )
             if op == "=":
                 queryset = queryset.filter(stopping_point=value)
             elif op == "!=":
                 queryset = queryset.exclude(stopping_point=value)
 
         elif key == "agent":
-            queryset = queryset.annotate(
-                handoff_target=_project_option_subquery("sentry:seer_automation_handoff_target"),
-            )
-
-            target = ALIAS_TO_CODING_AGENT.get(value)
-            if target is None:  # Null target/handoff means Seer agent.
+            target = ALIAS_TO_CODING_AGENT.get(value, value)
+            if target == "seer":
                 q = Q(handoff_target__isnull=True)
             else:
                 q = Q(handoff_target=target)
@@ -259,14 +252,6 @@ def _apply_search_filters(queryset, filters: Sequence[QueryToken]):
     return queryset
 
 
-class NightshiftTweaksSerializer(serializers.Serializer):
-    enabled = serializers.BooleanField(required=False, allow_null=True)
-    max_candidates = serializers.IntegerField(required=False, min_value=1, max_value=100)
-    extra_triage_instructions = serializers.CharField(required=False, allow_blank=True)
-    intelligence_level = serializers.ChoiceField(choices=["low", "medium", "high"], required=False)
-    reasoning_effort = serializers.ChoiceField(choices=["low", "medium", "high"], required=False)
-
-
 class ProjectSettingsUpdateSerializer(serializers.Serializer):
     agent = serializers.ChoiceField(choices=["seer", "cursor", "claude"], required=False)
     integrationId = serializers.IntegerField(required=False)
@@ -274,7 +259,6 @@ class ProjectSettingsUpdateSerializer(serializers.Serializer):
         choices=["off", "root_cause", "code_changes", "open_pr"], required=False
     )
     scannerAutomation = serializers.BooleanField(required=False)
-    nightshiftTweaks = NightshiftTweaksSerializer(required=False, allow_null=True)
 
     def validate_stoppingPoint(self, value: str) -> str:
         if value == "off":
@@ -291,9 +275,7 @@ class ProjectSettingsUpdateSerializer(serializers.Serializer):
                 {"integrationId": "Required when agent is an external coding agent."}
             )
 
-        has_update = any(
-            k in data for k in ("agent", "stoppingPoint", "scannerAutomation", "nightshiftTweaks")
-        )
+        has_update = any(k in data for k in ("agent", "stoppingPoint", "scannerAutomation"))
         if not has_update:
             raise serializers.ValidationError("At least one update field must be provided.")
 
@@ -324,12 +306,9 @@ class OrganizationSeerProjectSettingsEndpoint(OrganizationEndpoint):
         if order_by is None:
             return Response({"detail": f"Invalid sortBy: {sort_by}"}, status=400)
 
-        projects = self.get_projects(request, organization)
-        queryset = Project.objects.filter(id__in={p.id for p in projects}).annotate(
-            repos_count=Count(
-                "seerprojectrepository",
-                filter=Q(seerprojectrepository__repository__status=ObjectStatus.ACTIVE),
-            )
+        accessible_projects = self.get_projects(request, organization)
+        queryset = _annotate_queryset(
+            Project.objects.filter(id__in={p.id for p in accessible_projects})
         )
 
         if search_query:
@@ -341,7 +320,7 @@ class OrganizationSeerProjectSettingsEndpoint(OrganizationEndpoint):
 
         def on_results(projects: list[Project]) -> list[SeerProjectSettingsResponse]:
             attrs_by_project = _get_attrs_for_projects(projects)
-            return [_serialize_project_settings(p, attrs_by_project[p.id]) for p in projects]
+            return [_serialize_seer_project_settings(p, attrs_by_project[p.id]) for p in projects]
 
         return self.paginate(
             request=request,
@@ -361,12 +340,9 @@ class OrganizationSeerProjectSettingsEndpoint(OrganizationEndpoint):
         data = serializer.validated_data
         search_query = data.pop("query")
 
-        allowed_projects = self.get_projects(request, organization)
-        queryset = Project.objects.filter(id__in={p.id for p in allowed_projects}).annotate(
-            repos_count=Count(
-                "seerprojectrepository",
-                filter=Q(seerprojectrepository__repository__status=ObjectStatus.ACTIVE),
-            )
+        accessible_projects = self.get_projects(request, organization)
+        queryset = _annotate_queryset(
+            Project.objects.filter(id__in={p.id for p in accessible_projects})
         )
 
         if search_query:
@@ -405,7 +381,7 @@ class ProjectSeerSettingsEndpoint(ProjectEndpoint):
 
     def get(self, request: Request, project: Project) -> Response:
         attrs = _get_attrs_for_project(project)
-        return Response(_serialize_project_settings(project, attrs))
+        return Response(_serialize_seer_project_settings(project, attrs))
 
     def put(self, request: Request, project: Project) -> Response:
         serializer = ProjectSettingsUpdateSerializer(
@@ -424,4 +400,4 @@ class ProjectSeerSettingsEndpoint(ProjectEndpoint):
             data={"project_id": project.id},
         )
 
-        return Response(_serialize_project_settings(project, _get_attrs_for_project(project)))
+        return Response(_serialize_seer_project_settings(project, _get_attrs_for_project(project)))

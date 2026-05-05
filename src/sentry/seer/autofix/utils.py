@@ -713,7 +713,7 @@ def bulk_read_preferences_from_sentry_db(
 
 def update_seer_project_settings(project: Project, data: dict[str, Any]) -> None:
     """Apply high-level Seer settings to a project.
-    Expects: agent, integrationId, stoppingPoint, scannerAutomation, nightshiftTweaks."""
+    Expects: agent, integrationId, stoppingPoint, scannerAutomation."""
 
     def _set_if_not_default(key: str, value: Any, default: Any) -> None:
         """If we're trying to set a default, delete the option. Otherwise, set it."""
@@ -775,9 +775,6 @@ def update_seer_project_settings(project: Project, data: dict[str, Any]) -> None
         _set_if_not_default(
             "sentry:seer_scanner_automation", data["scannerAutomation"], default=True
         )
-
-    if "nightshiftTweaks" in data:
-        _set_if_not_default("sentry:seer_nightshift_tweaks", data["nightshiftTweaks"], default=None)
 
 
 def has_project_connected_repos(organization: Organization, project: Project) -> bool:
