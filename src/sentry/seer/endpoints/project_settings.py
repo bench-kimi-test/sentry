@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import enum
 from collections.abc import Mapping, Sequence
 from functools import partial
 from typing import Any, TypedDict
 
-from django.db.models import Case, CharField, Count, Func, OuterRef, Q, Subquery, Value, When
+from django.db.models import Case, Count, F, OuterRef, Q, Subquery, Value, When
 from django.db.models.functions import Coalesce
 from rest_framework import serializers
 from rest_framework.request import Request
@@ -25,6 +24,7 @@ from sentry.constants import (
     SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT,
     ObjectStatus,
 )
+from sentry.db.models.fields.jsonfield import LegacyTextJSONField
 from sentry.exceptions import InvalidSearchQuery
 from sentry.models.options.project_option import ProjectOption
 from sentry.models.organization import Organization
@@ -39,17 +39,11 @@ from sentry.seer.autofix.utils import (
     update_seer_project_settings,
 )
 from sentry.seer.models.project_repository import SeerProjectRepository
+from sentry.utils import json
 
-
-class CodingAgentAlias(enum.StrEnum):
-    SEER = "seer"
-    CURSOR = "cursor"
-    CLAUDE = "claude"
-
-
-CODING_AGENT_HANDOFF_TARGET_TO_ALIAS: dict[str, CodingAgentAlias] = {
-    "cursor_background_agent": CodingAgentAlias.CURSOR,
-    "claude_code_agent": CodingAgentAlias.CLAUDE,
+CODING_AGENT_HANDOFF_TARGET_TO_ALIAS: dict[str, str] = {
+    "cursor_background_agent": "cursor",
+    "claude_code_agent": "claude",
 }
 
 SORT_FIELDS_MAPPING: dict[str, str] = {
@@ -164,19 +158,14 @@ def _get_attrs_for_project(project: Project) -> dict[str, Any]:
 
 
 def _annotate_queryset(queryset):
-    def _project_option_subquery(key: str) -> Func:
-        # ProjectOption.value is a LegacyTextJSONField (text column storing JSON).
-        # String values are stored with surrounding double-quotes (e.g. '"off"'),
-        # which breaks SQL-level comparisons. Strip them so downstream annotations
-        # and filters work with plain strings.
-        return Func(
-            Subquery(
-                ProjectOption.objects.filter(project_id=OuterRef("id"), key=key).values("value")[:1]
-            ),
-            Value('"'),
-            Value(""),
-            function="REPLACE",
-            output_field=CharField(),
+    # ProjectOption.value is a LegacyTextJSONField — a text column storing JSON.
+    # Use LegacyTextJSONField as output_field. Coalesce fallback values must also
+    # be JSON-encoded to match what the DB stores.
+
+    def _project_option_subquery(key: str) -> Subquery:
+        return Subquery(
+            ProjectOption.objects.filter(project_id=OuterRef("id"), key=key).values("value")[:1],
+            output_field=LegacyTextJSONField(),
         )
 
     return queryset.annotate(
@@ -186,26 +175,30 @@ def _annotate_queryset(queryset):
         ),
         _tuning=Coalesce(
             _project_option_subquery("sentry:autofix_automation_tuning"),
-            Value(AUTOFIX_AUTOMATION_TUNING_DEFAULT),
-            output_field=CharField(),
+            Value(json.dumps(AUTOFIX_AUTOMATION_TUNING_DEFAULT)),
+            output_field=LegacyTextJSONField(),
         ),
         stopping_point=Case(
-            When(_tuning=AutofixAutomationTuningSettings.OFF, then=Value("off")),
+            When(_tuning=AutofixAutomationTuningSettings.OFF, then=Value(json.dumps("off"))),
             default=Coalesce(
                 _project_option_subquery("sentry:seer_automated_run_stopping_point"),
-                Value(SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT),
-                output_field=CharField(),
+                Value(json.dumps(SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT)),
+                output_field=LegacyTextJSONField(),
             ),
-            output_field=CharField(),
+            output_field=LegacyTextJSONField(),
         ),
         _handoff_target=_project_option_subquery("sentry:seer_automation_handoff_target"),
         agent=Case(
+            # Null/missing handoff target (ie, no configured external handoff) means use Seer agent.
+            When(_handoff_target=None, then=Value(json.dumps("seer"))),
+            # Convert raw handoff targets to their user-facing agent aliases.
             *[
-                When(_handoff_target=target, then=Value(alias))
+                When(_handoff_target=target, then=Value(json.dumps(alias)))
                 for target, alias in CODING_AGENT_HANDOFF_TARGET_TO_ALIAS.items()
             ],
-            default=Value(CodingAgentAlias.SEER),
-            output_field=CharField(),
+            # Leave unknown handoff targets as-is.
+            default=F("_handoff_target"),
+            output_field=LegacyTextJSONField(),
         ),
     )
 
@@ -283,7 +276,7 @@ class ProjectSettingsUpdateSerializer(serializers.Serializer):
         return value
 
     def validate(self, data):
-        if data.get("agent") != "seer" and "integrationId" not in data:
+        if "agent" in data and data["agent"] != "seer" and "integrationId" not in data:
             raise serializers.ValidationError(
                 {"integrationId": "Required when agent is an external coding agent."}
             )

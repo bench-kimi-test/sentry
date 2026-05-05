@@ -327,71 +327,80 @@ class OrganizationSeerProjectSettingsEndpointTest(APITestCase):
         assert response.status_code == 400
         assert "detail" in response.data
 
-    # ── PUT: bulk update ─────────────────────────────────────────────
+    def test_put_updates_all_projects(self) -> None:
+        """Empty query should update all accessible projects."""
+        project2 = self.create_project(organization=self.organization)
 
-    def test_put_empty_query_updates_all_projects(self) -> None:
-        """Omitting or sending an empty query should update all accessible projects."""
-        raise NotImplementedError
+        response = self.client.put(self.url, data={"scannerAutomation": False}, format="json")
 
-    def test_put_updates_agent_to_seer(self) -> None:
-        """Setting agent=seer should clear all handoff options."""
-        raise NotImplementedError
-
-    def test_put_updates_agent_to_external_handoff(self) -> None:
-        """Setting agent=cursor with integrationId should set handoff options."""
-        raise NotImplementedError
-
-    def test_put_updates_stopping_point_off(self) -> None:
-        """stoppingPoint=off should set tuning to OFF."""
-        raise NotImplementedError
-
-    def test_put_updates_stopping_point(self) -> None:
-        """stoppingPoint=code_changes should set tuning to MEDIUM and store the value."""
-        raise NotImplementedError
-
-    def test_put_updates_scanner_automation(self) -> None:
-        """scannerAutomation=false should update the project option."""
-        raise NotImplementedError
-
-    def test_put_deletes_option_when_value_is_default(self) -> None:
-        """Setting a value equal to its registered default should delete the ProjectOption row."""
-        raise NotImplementedError
+        assert response.status_code == 204
+        assert self.project.get_option("sentry:seer_scanner_automation") is False
+        assert project2.get_option("sentry:seer_scanner_automation") is False
 
     def test_put_applies_to_filtered_projects_only(self) -> None:
         """The query parameter should scope which projects get updated."""
-        raise NotImplementedError
+        project2 = self.create_project(organization=self.organization)
+        project2.update_option("sentry:seer_automation_handoff_target", "cursor_background_agent")
 
-    def test_put_excludes_inaccessible_projects(self) -> None:
-        """Bulk update should only touch projects the user has access to."""
-        raise NotImplementedError
+        response = self.client.put(
+            self.url, data={"query": "agent:cursor", "scannerAutomation": False}, format="json"
+        )
 
-    # ── PUT: validation ──────────────────────────────────────────────
+        assert response.status_code == 204
+        assert project2.get_option("sentry:seer_scanner_automation") is False
+        assert self.project.get_option("sentry:seer_scanner_automation") is True
 
     def test_put_requires_at_least_one_update_field(self) -> None:
         """Sending only query with no update fields should return 400."""
-        raise NotImplementedError
+        response = self.client.put(self.url, data={"query": ""}, format="json")
+        assert response.status_code == 400
 
     def test_put_requires_integration_id_for_external_agent(self) -> None:
         """agent=cursor without integrationId should return 400."""
-        raise NotImplementedError
+        response = self.client.put(self.url, data={"agent": "cursor"}, format="json")
+        assert response.status_code == 400
 
     def test_put_rejects_invalid_agent(self) -> None:
         """An unrecognized agent value should return 400."""
-        raise NotImplementedError
+        response = self.client.put(self.url, data={"agent": "invalid"}, format="json")
+        assert response.status_code == 400
 
     def test_put_rejects_invalid_stopping_point(self) -> None:
         """An unrecognized stoppingPoint value should return 400."""
-        raise NotImplementedError
+        response = self.client.put(self.url, data={"stoppingPoint": "invalid"}, format="json")
+        assert response.status_code == 400
 
     def test_put_invalid_search_query_returns_400(self) -> None:
         """A malformed query value should return 400."""
-        raise NotImplementedError
-
-    # ── PUT: audit log ───────────────────────────────────────────────
+        response = self.client.put(
+            self.url, data={"query": "invalidKey:value", "scannerAutomation": False}, format="json"
+        )
+        assert response.status_code == 400
 
     def test_put_creates_audit_log_entry(self) -> None:
         """Bulk update should create an audit log entry with project count and IDs."""
-        raise NotImplementedError
+        from sentry.models.auditlogentry import AuditLogEntry
+        from sentry.silo.base import SiloMode
+        from sentry.testutils.outbox import outbox_runner
+        from sentry.testutils.silo import assume_test_silo_mode
+
+        project2 = self.create_project(organization=self.organization)
+
+        with outbox_runner():
+            self.client.put(
+                self.url,
+                data={"scannerAutomation": False},
+                format="json",
+            )
+
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            entry = AuditLogEntry.objects.filter(
+                organization_id=self.organization.id,
+            ).first()
+
+            assert entry is not None
+            assert entry.data["project_count"] == 2
+            assert set(entry.data["project_ids"]) == {self.project.id, project2.id}
 
 
 class ProjectSeerSettingsEndpointTest(APITestCase):

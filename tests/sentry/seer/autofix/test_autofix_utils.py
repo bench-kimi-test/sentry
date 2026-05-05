@@ -1567,8 +1567,6 @@ class TestUpdateSeerProjectSettings(TestCase):
         super().setUp()
         self.project = self.create_project(organization=self.organization)
 
-    # ── agent ────────────────────────────────────────────────────────
-
     def test_agent_seer_clears_handoff_options(self) -> None:
         """Setting agent=seer should delete all handoff-related project options."""
         self.project.update_option(
@@ -1628,8 +1626,6 @@ class TestUpdateSeerProjectSettings(TestCase):
             project=self.project, key="sentry:seer_automation_handoff_auto_create_pr"
         ).exists()
 
-    # ── stoppingPoint ────────────────────────────────────────────────
-
     def test_stopping_point_off_sets_tuning_off(self) -> None:
         """stoppingPoint=off should set tuning to OFF."""
         self.project.update_option(
@@ -1668,8 +1664,6 @@ class TestUpdateSeerProjectSettings(TestCase):
         )
         assert self.project.get_option("sentry:seer_automated_run_stopping_point") == "open_pr"
 
-    # ── scannerAutomation ────────────────────────────────────────────
-
     def test_scanner_automation_false(self) -> None:
         """scannerAutomation=false should update the project option."""
         update_seer_project_settings(self.project, {"scannerAutomation": False})
@@ -1683,8 +1677,6 @@ class TestUpdateSeerProjectSettings(TestCase):
         update_seer_project_settings(self.project, {"stoppingPoint": "off"})
 
         assert self.project.get_option("sentry:seer_scanner_automation") is False
-
-    # ── default deletion ─────────────────────────────────────────────
 
     def test_deletes_option_when_value_equals_default(self) -> None:
         """Setting a value equal to its registered default should delete the ProjectOption row."""
