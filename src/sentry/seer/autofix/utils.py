@@ -31,7 +31,11 @@ from sentry.models.project import Project
 from sentry.models.repository import Repository
 from sentry.net.http import connection_from_url
 from sentry.projectoptions.defaults import SEER_PROJECT_PREFERENCE_OPTION_KEYS
-from sentry.seer.autofix.constants import AutofixAutomationTuningSettings, AutofixStatus
+from sentry.seer.autofix.constants import (
+    ALIAS_TO_CODING_AGENT,
+    AutofixAutomationTuningSettings,
+    AutofixStatus,
+)
 from sentry.seer.constants import SEER_SUPPORTED_SCM_PROVIDERS
 from sentry.seer.models import (
     AutofixHandoffPoint,
@@ -611,10 +615,10 @@ def build_repo_definition_from_project_repo(
     )
 
 
-def _build_automation_handoff(
+def build_automation_handoff(
     get_option: Callable[[str], Any],
 ) -> SeerAutomationHandoffConfiguration | None:
-    """Build a SeerAutomationHandoffConfiguration from option values, or None if incomplete."""
+    """Build a SeerAutomationHandoffConfiguration from option key/value pairs, or None if incomplete."""
     handoff_point = get_option("sentry:seer_automation_handoff_point")
     handoff_target = get_option("sentry:seer_automation_handoff_target")
     handoff_integration_id = get_option("sentry:seer_automation_handoff_integration_id")
@@ -650,7 +654,7 @@ def read_preference_from_sentry_db(project: Project) -> SeerProjectPreference:
         project_id=project.id,
         repositories=repo_definitions,
         automated_run_stopping_point=project.get_option("sentry:seer_automated_run_stopping_point"),
-        automation_handoff=_build_automation_handoff(project.get_option),
+        automation_handoff=build_automation_handoff(project.get_option),
         autofix_automation_tuning=project.get_option("sentry:autofix_automation_tuning"),
     )
 
@@ -699,11 +703,50 @@ def bulk_read_preferences_from_sentry_db(
             automated_run_stopping_point=_get_project_option(
                 "sentry:seer_automated_run_stopping_point"
             ),
-            automation_handoff=_build_automation_handoff(_get_project_option),
+            automation_handoff=build_automation_handoff(_get_project_option),
             autofix_automation_tuning=_get_project_option("sentry:autofix_automation_tuning"),
         )
 
     return result
+
+
+def update_seer_project_settings(project: Project, data: dict[str, Any]) -> None:
+    """Apply high-level Seer settings fields to a project."""
+    if "automationTuning" in data:
+        project.update_option("sentry:autofix_automation_tuning", data["automationTuning"])
+
+    if "agent" in data:
+        agent: str = data["agent"]
+        if agent == "seer":
+            project.delete_option("sentry:seer_automation_handoff_point")
+            project.delete_option("sentry:seer_automation_handoff_target")
+            project.delete_option("sentry:seer_automation_handoff_integration_id")
+        else:
+            integration_id: int | None = data.get("integrationId")
+            if integration_id is None:
+                raise ValueError("integrationId is required for external coding agents")
+
+            project.update_option(
+                "sentry:seer_automation_handoff_point", AutofixHandoffPoint.ROOT_CAUSE
+            )
+            project.update_option(
+                "sentry:seer_automation_handoff_target", ALIAS_TO_CODING_AGENT.get(agent, agent)
+            )
+            project.update_option("sentry:seer_automation_handoff_integration_id", integration_id)
+
+    if "stoppingPoint" in data:
+        stopping_point: str = data["stoppingPoint"]
+        project.update_option("sentry:seer_automated_run_stopping_point", stopping_point)
+        if stopping_point == "open_pr":
+            project.update_option("sentry:seer_automation_handoff_auto_create_pr", True)
+        else:
+            project.delete_option("sentry:seer_automation_handoff_auto_create_pr")
+
+    if "scannerAutomation" in data:
+        project.update_option("sentry:seer_scanner_automation", data["scannerAutomation"])
+
+    if "nightshiftTweaks" in data:
+        project.update_option("sentry:seer_nightshift_tweaks", data["nightshiftTweaks"])
 
 
 def has_project_connected_repos(organization: Organization, project: Project) -> bool:

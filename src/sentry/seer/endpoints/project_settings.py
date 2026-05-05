@@ -1,0 +1,445 @@
+from __future__ import annotations
+
+import enum
+from collections.abc import Mapping, Sequence
+from functools import partial
+from typing import Any, TypedDict
+
+from django.db.models import Case, CharField, Count, OuterRef, Q, Subquery, Value, When
+from django.db.models.functions import Coalesce
+from rest_framework import serializers
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+from sentry import audit_log, projectoptions
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import cell_silo_endpoint
+from sentry.api.bases.organization import OrganizationEndpoint, OrganizationPermission
+from sentry.api.bases.project import ProjectEndpoint, ProjectEventPermission
+from sentry.api.event_search import QueryToken, SearchConfig, SearchFilter
+from sentry.api.event_search import parse_search_query as base_parse_search_query
+from sentry.api.paginator import OffsetPaginator
+from sentry.constants import SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT, ObjectStatus
+from sentry.exceptions import InvalidSearchQuery
+from sentry.models.options.project_option import ProjectOption
+from sentry.models.organization import Organization
+from sentry.models.project import Project
+from sentry.projectoptions.defaults import SEER_PROJECT_PREFERENCE_OPTION_KEYS
+from sentry.seer.autofix.constants import AutofixAutomationTuningSettings
+from sentry.seer.autofix.utils import (
+    CodingAgentProviderType,
+    build_automation_handoff,
+    get_valid_automated_run_stopping_points,
+    update_seer_project_settings,
+)
+from sentry.seer.models.project_repository import SeerProjectRepository
+
+
+class CodingAgentAlias(enum.StrEnum):
+    NONE = "none"
+    SEER = "seer"
+    CURSOR = "cursor"
+    CLAUDE = "claude"
+
+
+CODING_AGENT_TO_ALIAS: dict[str, CodingAgentAlias] = {
+    CodingAgentProviderType.CURSOR_BACKGROUND_AGENT: CodingAgentAlias.CURSOR,
+    CodingAgentProviderType.CLAUDE_CODE_AGENT: CodingAgentAlias.CLAUDE,
+}
+
+SORT_FIELDS_MAPPING: dict[str, str] = {
+    "name": "slug",
+    "-name": "-slug",
+    "reposCount": "repos_count",
+    "-reposCount": "-repos_count",
+}
+
+search_config = SearchConfig.create_from(
+    SearchConfig(),
+    allowed_keys={"id", "name", "reposCount", "stoppingPoint", "agent"},
+    numeric_keys={"id", "reposCount"},
+    allow_boolean=False,
+    free_text_key="name",
+)
+parse_search_query = partial(base_parse_search_query, config=search_config)
+
+
+class SeerProjectSettingsResponse(TypedDict):
+    projectId: int
+    projectSlug: str
+    tuning: str
+    agent: CodingAgentAlias
+    integrationId: str | None
+    stoppingPoint: str
+    scannerAutomation: bool
+    nightshiftTweaks: dict | None
+    reposCount: int
+
+
+def _serialize_project_settings(
+    project: Project, attrs: dict[str, Any]
+) -> SeerProjectSettingsResponse:
+    tuning: str = attrs["sentry:autofix_automation_tuning"]
+
+    # Automation tuning takes precedence over the actual stopping point.
+    if tuning == AutofixAutomationTuningSettings.OFF:
+        stopping_point = "off"
+    else:
+        stopping_point = attrs["sentry:seer_automated_run_stopping_point"]
+
+    # Automation tuning takes precedence over the actual handoff configuration.
+    handoff = build_automation_handoff(attrs.get)
+    if tuning == AutofixAutomationTuningSettings.OFF or handoff is None:
+        agent: CodingAgentAlias = CodingAgentAlias.SEER
+        integration_id: str | None = None
+    else:
+        agent = CODING_AGENT_TO_ALIAS[handoff.target]
+        integration_id = str(handoff.integration_id)
+
+    return SeerProjectSettingsResponse(
+        projectId=project.id,
+        projectSlug=project.slug,
+        tuning=tuning,
+        agent=agent,
+        integrationId=integration_id,
+        stoppingPoint=stopping_point,
+        scannerAutomation=attrs["sentry:seer_scanner_automation"],
+        nightshiftTweaks=attrs["sentry:seer_nightshift_tweaks"],
+        reposCount=attrs["repos_count"],
+    )
+
+
+def _get_attrs_for_projects(
+    projects: list[Project],
+) -> dict[int, dict[str, Any]]:
+    if not projects:
+        return {}
+
+    project_ids = [p.id for p in projects]
+
+    project_options: dict[str, Mapping[int, Any]] = {
+        key: ProjectOption.objects.get_value_bulk_id(project_ids, key)
+        for key in SEER_PROJECT_PREFERENCE_OPTION_KEYS
+    }
+
+    repo_counts: dict[int, int] = dict(
+        SeerProjectRepository.objects.filter(
+            project_id__in=project_ids,
+            repository__status=ObjectStatus.ACTIVE,
+        )
+        .values_list("project_id")
+        .annotate(count=Count("id"))
+        .values_list("project_id", "count")
+    )
+
+    attrs_by_project: dict[int, dict[str, Any]] = {}
+    for project in projects:
+        attrs_by_project[project.id] = {}
+
+        for key in SEER_PROJECT_PREFERENCE_OPTION_KEYS:
+            value = project_options[key].get(project.id)
+            if value is None:
+                value = projectoptions.get_well_known_default(key, project=project)
+            attrs_by_project[project.id][key] = value
+
+        attrs_by_project[project.id]["repos_count"] = repo_counts.get(project.id, 0)
+
+    return attrs_by_project
+
+
+def _get_attrs_for_project(project: Project) -> dict[str, Any]:
+    attrs: dict[str, Any] = {}
+
+    for key in SEER_PROJECT_PREFERENCE_OPTION_KEYS:
+        attrs[key] = project.get_option(key)
+
+    attrs["repos_count"] = SeerProjectRepository.objects.filter(
+        project=project, repository__status=ObjectStatus.ACTIVE
+    ).count()
+
+    return attrs
+
+
+def _apply_search_filters(queryset, filters: Sequence[QueryToken]):
+    """Apply parsed search tokens to a Project queryset.
+
+    All filters must be applied at the DB level so pagination is correct.
+    Supported tokens: id, name, reposCount, stoppingPoint, agent.
+    """
+
+    def _project_option_subquery(key: str) -> Subquery:
+        return Subquery(
+            ProjectOption.objects.filter(project_id=OuterRef("id"), key=key).values("value")[:1]
+        )
+
+    for f in filters:
+        if not isinstance(f, SearchFilter):
+            continue
+
+        key = f.key.name
+        op = f.operator
+        value = f.value.value
+
+        if key == "id":
+            if op == "IN":
+                queryset = queryset.filter(id__in=[int(v) for v in value])
+            elif op == "NOT IN":
+                queryset = queryset.exclude(id__in=[int(v) for v in value])
+            elif op == "=":
+                queryset = queryset.filter(id=int(value))
+            elif op == "!=":
+                queryset = queryset.exclude(id=int(value))
+
+        elif key == "name":
+            if op == "=":
+                queryset = queryset.filter(Q(name__icontains=value) | Q(slug__icontains=value))
+            elif op == "!=":
+                queryset = queryset.exclude(Q(name__icontains=value) & Q(slug__icontains=value))
+
+        elif key == "reposCount":
+            # We could have already annotated repos_count for ordering. Check before we annotate again.
+            if "repos_count" not in queryset.query.annotations:
+                queryset = queryset.annotate(
+                    repos_count=Count(
+                        "seerprojectrepository",
+                        filter=Q(seerprojectrepository__repository__status=ObjectStatus.ACTIVE),
+                    )
+                )
+            count = int(value)
+            if op == "=":
+                queryset = queryset.filter(repos_count=count)
+            elif op == "!=":
+                queryset = queryset.exclude(repos_count=count)
+            elif op == ">":
+                queryset = queryset.filter(repos_count__gt=count)
+            elif op == "<":
+                queryset = queryset.filter(repos_count__lt=count)
+            elif op == ">=":
+                queryset = queryset.filter(repos_count__gte=count)
+            elif op == "<=":
+                queryset = queryset.filter(repos_count__lte=count)
+
+        elif key == "stoppingPoint":
+            queryset = queryset.annotate(
+                stopping_point=Coalesce(
+                    _project_option_subquery("sentry:seer_automated_run_stopping_point"),
+                    Value(SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT),
+                )
+            )
+            if op == "=":
+                queryset = queryset.filter(stopping_point=value)
+            elif op == "!=":
+                queryset = queryset.exclude(stopping_point=value)
+
+        elif key == "agent":
+            # Agent depends on autofix_automation_tuning and whether we have
+            # an external handoff target (eg, Cursor or Claude) or just use Seer.
+            queryset = queryset.annotate(
+                _tuning=Coalesce(
+                    _project_option_subquery("sentry:autofix_automation_tuning"),
+                    Value(AutofixAutomationTuningSettings.OFF),
+                ),
+                _handoff_target=_project_option_subquery("sentry:seer_automation_handoff_target"),
+                agent=Case(
+                    # No automation -> no agent.
+                    When(_tuning=AutofixAutomationTuningSettings.OFF, then=Value("none")),
+                    # Automation on, look for external handoff targets.
+                    When(
+                        _handoff_target=CodingAgentProviderType.CURSOR_BACKGROUND_AGENT,
+                        then=Value("cursor"),
+                    ),
+                    When(
+                        _handoff_target=CodingAgentProviderType.CLAUDE_CODE_AGENT,
+                        then=Value("claude"),
+                    ),
+                    # Automation on but no handoff target -> Seer agent.
+                    default=Value("seer"),
+                    output_field=CharField(),
+                ),
+            )
+            if op == "=":
+                queryset = queryset.filter(agent=value)
+            elif op == "!=":
+                queryset = queryset.exclude(agent=value)
+
+    return queryset
+
+
+class NightshiftTweaksSerializer(serializers.Serializer):
+    enabled = serializers.BooleanField(required=False, allow_null=True)
+    max_candidates = serializers.IntegerField(required=False, min_value=1, max_value=100)
+    extra_triage_instructions = serializers.CharField(required=False, allow_blank=True)
+    intelligence_level = serializers.ChoiceField(choices=["low", "medium", "high"], required=False)
+    reasoning_effort = serializers.ChoiceField(choices=["low", "medium", "high"], required=False)
+
+
+class ProjectSettingsUpdateSerializer(serializers.Serializer):
+    automationTuning = serializers.ChoiceField(
+        choices=["off", "low", "medium", "high", "always"], required=False
+    )
+    agent = serializers.ChoiceField(choices=["seer", "cursor", "claude"], required=False)
+    integrationId = serializers.IntegerField(required=False)
+    stoppingPoint = serializers.ChoiceField(
+        choices=["root_cause", "code_changes", "open_pr"], required=False
+    )
+    scannerAutomation = serializers.BooleanField(required=False)
+    nightshiftTweaks = NightshiftTweaksSerializer(required=False, allow_null=True)
+
+    def validate_stoppingPoint(self, value: str) -> str:
+        organization = self.context["organization"]
+        if value not in get_valid_automated_run_stopping_points(organization):
+            raise serializers.ValidationError(f'"{value}" is not a valid choice.')
+        return value
+
+    def validate(self, data):
+        agent = data.get("agent")
+
+        if agent not in (None, "seer") and "integrationId" not in data:
+            raise serializers.ValidationError(
+                {"integrationId": "Required when agent is an external coding agent."}
+            )
+
+        has_update = any(
+            k in data
+            for k in (
+                "automationTuning",
+                "agent",
+                "stoppingPoint",
+                "scannerAutomation",
+                "nightshiftTweaks",
+            )
+        )
+        if not has_update:
+            raise serializers.ValidationError("At least one update field must be provided.")
+
+        return data
+
+
+class BulkProjectSettingsUpdateSerializer(ProjectSettingsUpdateSerializer):
+    query = serializers.CharField(required=True)
+
+    def validate(self, data):
+        return super().validate(data)
+
+
+@cell_silo_endpoint
+class OrganizationSeerProjectSettingsEndpoint(OrganizationEndpoint):
+    owner = ApiOwner.ML_AI
+    publish_status = {
+        "GET": ApiPublishStatus.EXPERIMENTAL,
+        "PUT": ApiPublishStatus.EXPERIMENTAL,
+    }
+    permission_classes = (OrganizationPermission,)
+
+    def get(self, request: Request, organization: Organization) -> Response:
+        search_query = request.GET.get("query", "")
+
+        sort_by = request.GET.get("sortBy", "name")
+        order_by = SORT_FIELDS_MAPPING.get(sort_by)
+        if order_by is None:
+            return Response({"detail": f"Invalid sortBy: {sort_by}"}, status=400)
+
+        queryset = Project.objects.filter(organization_id=organization.id).annotate(
+            # Annotate repos_count in case we're sorting by it.
+            repos_count=Count(
+                "seerprojectrepository",
+                filter=Q(seerprojectrepository__repository__status=ObjectStatus.ACTIVE),
+            )
+        )
+
+        if search_query:
+            try:
+                search_filters = parse_search_query(search_query)
+            except InvalidSearchQuery as e:
+                return Response({"detail": str(e)}, status=400)
+            queryset = _apply_search_filters(queryset, search_filters)
+
+        def on_results(projects: list[Project]) -> list[SeerProjectSettingsResponse]:
+            attrs_by_project = _get_attrs_for_projects(projects)
+            return [_serialize_project_settings(p, attrs_by_project[p.id]) for p in projects]
+
+        return self.paginate(
+            request=request,
+            queryset=queryset,
+            order_by=order_by,
+            on_results=on_results,
+            paginator_cls=OffsetPaginator,
+        )
+
+    def put(self, request: Request, organization: Organization) -> Response:
+        serializer = BulkProjectSettingsUpdateSerializer(
+            data=request.data, context={"organization": organization}
+        )
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=400)
+
+        data = serializer.validated_data
+        search_query = data.pop("query")
+
+        queryset = Project.objects.filter(organization_id=organization.id).annotate(
+            repos_count=Count(
+                "seerprojectrepository",
+                filter=Q(seerprojectrepository__repository__status=ObjectStatus.ACTIVE),
+            )
+        )
+
+        if search_query:
+            try:
+                filters = parse_search_query(search_query)
+            except InvalidSearchQuery as e:
+                return Response({"detail": str(e)}, status=400)
+            queryset = _apply_search_filters(queryset, filters)
+
+        projects = list(
+            self.get_projects(request, organization, project_ids={p.id for p in queryset})
+        )
+
+        for project in projects:
+            update_seer_project_settings(project, data)
+
+        self.create_audit_entry(
+            request=request,
+            organization=organization,
+            target_object=organization.id,
+            event=audit_log.get_event_id("AUTOFIX_SETTINGS_EDIT"),
+            data={
+                "project_count": len(projects),
+                "project_ids": [p.id for p in projects],
+            },
+        )
+
+        return Response(status=204)
+
+
+@cell_silo_endpoint
+class ProjectSeerSettingsEndpoint(ProjectEndpoint):
+    owner = ApiOwner.ML_AI
+    publish_status = {
+        "GET": ApiPublishStatus.EXPERIMENTAL,
+        "PUT": ApiPublishStatus.EXPERIMENTAL,
+    }
+    permission_classes = (ProjectEventPermission,)
+
+    def get(self, request: Request, project: Project) -> Response:
+        attrs = _get_attrs_for_project(project)
+        return Response(_serialize_project_settings(project, attrs))
+
+    def put(self, request: Request, project: Project) -> Response:
+        serializer = ProjectSettingsUpdateSerializer(
+            data=request.data, context={"organization": project.organization}
+        )
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=400)
+
+        update_seer_project_settings(project, serializer.validated_data)
+
+        self.create_audit_entry(
+            request=request,
+            organization=project.organization,
+            target_object=project.id,
+            event=audit_log.get_event_id("AUTOFIX_SETTINGS_EDIT"),
+            data={"project_id": project.id},
+        )
+
+        return Response(_serialize_project_settings(project, _get_attrs_for_project(project)))
