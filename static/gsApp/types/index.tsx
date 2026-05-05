@@ -37,7 +37,7 @@ declare global {
   }
 
   namespace React {
-    interface DOMAttributes<T> {
+    interface DOMAttributes<_T> {
       'data-test-id'?: string;
     }
   }
@@ -629,6 +629,9 @@ export type InvoiceBase = StructuredAddress & {
     url: string;
   };
   sentryTaxIds: SentryTaxIds | null;
+  // Whether the receipts list should link this row to a detail page. False
+  // for invoices that only support PDF download (e.g. platform invoices).
+  showLink: boolean;
   taxNumber: string | null;
   type: string | null;
 };

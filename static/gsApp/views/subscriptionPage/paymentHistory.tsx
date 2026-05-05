@@ -156,6 +156,7 @@ function ReceiptGrid({
         </Grid>
         {payments.map(payment => {
           const url = `/settings/${organization.slug}/billing/receipts/${payment.id}/`;
+          const formattedDate = moment(payment.dateCreated).format('MMM D, YYYY');
           return (
             <Grid
               key={payment.id}
@@ -165,7 +166,11 @@ function ReceiptGrid({
               borderTop="primary"
               padding="xl"
             >
-              <Link to={url}>{moment(payment.dateCreated).format('MMM D, YYYY')}</Link>
+              {payment.showLink ? (
+                <Link to={url}>{formattedDate}</Link>
+              ) : (
+                <Text>{formattedDate}</Text>
+              )}
               <Container>
                 <Text align="right">{formatCurrency(payment.amountBilled ?? 0)}</Text>
                 {!!payment.amountRefunded && (
