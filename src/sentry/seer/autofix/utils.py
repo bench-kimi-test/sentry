@@ -758,10 +758,10 @@ def update_seer_project_settings(project: Project, data: dict[str, Any]) -> None
                     False,
                 )
 
-    if stopping_point is not None:
+    if "stoppingPoint" in data:
         _set(
             "sentry:seer_automated_run_stopping_point",
-            stopping_point,
+            data["stoppingPoint"],
             SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT,
         )
 
