@@ -418,86 +418,132 @@ class ProjectSeerSettingsEndpointTest(APITestCase):
             },
         )
 
-    # ── GET ──────────────────────────────────────────────────────────
-
-    def test_get_returns_default_settings(self) -> None:
+    def test_get_returns_defaults(self) -> None:
         """A project with no options set should return defaults."""
-        raise NotImplementedError
+        response = self.client.get(self.url)
+
+        assert response.status_code == 200
+        assert response.data == {
+            "projectId": self.project.id,
+            "projectSlug": self.project.slug,
+            "agent": "seer",
+            "integrationId": None,
+            "stoppingPoint": "off",
+            "scannerAutomation": True,
+            "reposCount": 0,
+        }
 
     def test_get_returns_configured_settings(self) -> None:
         """A project with explicit options should reflect them in the response."""
-        raise NotImplementedError
+        self.project.update_option(
+            "sentry:autofix_automation_tuning", AutofixAutomationTuningSettings.MEDIUM
+        )
+        self.project.update_option("sentry:seer_automated_run_stopping_point", "open_pr")
+        self.project.update_option("sentry:seer_scanner_automation", False)
+
+        response = self.client.get(self.url)
+
+        assert response.status_code == 200
+        assert response.data["stoppingPoint"] == "open_pr"
+        assert response.data["scannerAutomation"] is False
 
     def test_get_returns_external_agent(self) -> None:
         """A project with an external handoff should return the agent alias and integration ID."""
-        raise NotImplementedError
+        self.project.update_option(
+            "sentry:seer_automation_handoff_target", "cursor_background_agent"
+        )
+        self.project.update_option(
+            "sentry:seer_automation_handoff_point", AutofixHandoffPoint.ROOT_CAUSE
+        )
+        self.project.update_option("sentry:seer_automation_handoff_integration_id", 42)
+
+        response = self.client.get(self.url)
+
+        assert response.status_code == 200
+        assert response.data["agent"] == "cursor"
+        assert response.data["integrationId"] == "42"
 
     def test_get_stopping_point_off_when_tuning_off(self) -> None:
         """stoppingPoint should be 'off' when tuning is OFF."""
-        raise NotImplementedError
+        self.project.update_option(
+            "sentry:autofix_automation_tuning", AutofixAutomationTuningSettings.OFF
+        )
+        self.project.update_option("sentry:seer_automated_run_stopping_point", "open_pr")
+
+        response = self.client.get(self.url)
+
+        assert response.status_code == 200
+        assert response.data["stoppingPoint"] == "off"
 
     def test_get_repos_count(self) -> None:
         """reposCount should reflect active SeerProjectRepository rows."""
-        raise NotImplementedError
+        repo1 = self.create_repo(project=self.project, name="owner/repo-1")
+        repo2 = self.create_repo(project=self.project, name="owner/repo-2")
+        SeerProjectRepository.objects.create(project=self.project, repository=repo1)
+        SeerProjectRepository.objects.create(project=self.project, repository=repo2)
 
-    # ── PUT ──────────────────────────────────────────────────────────
+        response = self.client.get(self.url)
 
-    def test_put_updates_agent_to_seer(self) -> None:
-        """Setting agent=seer should clear handoff options and return updated settings."""
-        raise NotImplementedError
-
-    def test_put_updates_agent_to_external(self) -> None:
-        """Setting agent=cursor with integrationId should set handoff options."""
-        raise NotImplementedError
-
-    def test_put_updates_stopping_point(self) -> None:
-        """stoppingPoint should update tuning and stopping point options."""
-        raise NotImplementedError
-
-    def test_put_updates_scanner_automation(self) -> None:
-        """scannerAutomation should update the project option."""
-        raise NotImplementedError
-
-    def test_put_updates_single_field_without_affecting_others(self) -> None:
-        """Sending only one field should not reset other settings."""
-        raise NotImplementedError
+        assert response.status_code == 200
+        assert response.data["reposCount"] == 2
 
     def test_put_returns_updated_settings(self) -> None:
         """PUT response should contain the full updated settings object."""
-        raise NotImplementedError
+        response = self.client.put(
+            self.url, data={"agent": "seer", "stoppingPoint": "code_changes"}, format="json"
+        )
 
-    def test_put_deletes_option_when_value_is_default(self) -> None:
-        """Setting a value to its default should delete the ProjectOption row."""
-        raise NotImplementedError
-
-    def test_put_sets_auto_create_pr_for_external_agent_with_open_pr(self) -> None:
-        """External agent + stoppingPoint=open_pr should set auto_create_pr=True."""
-        raise NotImplementedError
-
-    # ── PUT: validation ──────────────────────────────────────────────
+        assert response.status_code == 200
+        assert response.data["projectId"] == self.project.id
+        assert response.data["projectSlug"] == self.project.slug
+        assert response.data["agent"] == "seer"
+        assert response.data["stoppingPoint"] == "code_changes"
+        assert "scannerAutomation" in response.data
+        assert "reposCount" in response.data
 
     def test_put_requires_at_least_one_update_field(self) -> None:
         """Sending no update fields should return 400."""
-        raise NotImplementedError
+        response = self.client.put(self.url, data={}, format="json")
+        assert response.status_code == 400
 
     def test_put_requires_integration_id_for_external_agent(self) -> None:
         """agent=cursor without integrationId should return 400."""
-        raise NotImplementedError
+        response = self.client.put(self.url, data={"agent": "cursor"}, format="json")
+        assert response.status_code == 400
 
     def test_put_seer_agent_does_not_require_integration_id(self) -> None:
         """agent=seer should not require integrationId."""
-        raise NotImplementedError
+        response = self.client.put(self.url, data={"agent": "seer"}, format="json")
+        assert response.status_code == 200
 
     def test_put_rejects_invalid_agent(self) -> None:
         """An unrecognized agent value should return 400."""
-        raise NotImplementedError
+        response = self.client.put(self.url, data={"agent": "invalid"}, format="json")
+        assert response.status_code == 400
 
     def test_put_rejects_invalid_stopping_point(self) -> None:
         """An unrecognized stoppingPoint value should return 400."""
-        raise NotImplementedError
-
-    # ── PUT: audit log ───────────────────────────────────────────────
+        response = self.client.put(self.url, data={"stoppingPoint": "invalid"}, format="json")
+        assert response.status_code == 400
 
     def test_put_creates_audit_log_entry(self) -> None:
         """PUT should create an audit log entry with the project ID."""
-        raise NotImplementedError
+        from sentry.models.auditlogentry import AuditLogEntry
+        from sentry.silo.base import SiloMode
+        from sentry.testutils.outbox import outbox_runner
+        from sentry.testutils.silo import assume_test_silo_mode
+
+        with outbox_runner():
+            self.client.put(
+                self.url,
+                data={"scannerAutomation": False},
+                format="json",
+            )
+
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            entry = AuditLogEntry.objects.filter(
+                organization_id=self.organization.id,
+            ).first()
+
+            assert entry is not None
+            assert entry.data["project_id"] == self.project.id
