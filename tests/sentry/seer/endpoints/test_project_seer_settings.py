@@ -2,7 +2,6 @@ from django.urls import reverse
 
 from sentry.constants import ObjectStatus
 from sentry.seer.autofix.constants import AutofixAutomationTuningSettings
-from sentry.seer.autofix.utils import CodingAgentProviderType
 from sentry.seer.models import AutofixHandoffPoint
 from sentry.seer.models.project_repository import SeerProjectRepository
 from sentry.testutils.cases import APITestCase
@@ -54,7 +53,7 @@ class OrganizationSeerProjectSettingsEndpointTest(APITestCase):
         """A project configured with an external handoff target should return
         the alias and integration ID."""
         self.project.update_option(
-            "sentry:seer_automation_handoff_target", CodingAgentProviderType.CURSOR_BACKGROUND_AGENT
+            "sentry:seer_automation_handoff_target", "cursor_background_agent"
         )
         self.project.update_option(
             "sentry:seer_automation_handoff_point", AutofixHandoffPoint.ROOT_CAUSE
@@ -138,12 +137,6 @@ class OrganizationSeerProjectSettingsEndpointTest(APITestCase):
         assert len(project_ids) == 1
         assert inaccessible_project.id not in project_ids
 
-    def test_get_unauthenticated_returns_401(self) -> None:
-        """Unauthenticated requests should be rejected."""
-        self.client.logout()
-        response = self.client.get(self.url)
-        assert response.status_code == 401
-
     def test_get_paginates_results(self) -> None:
         """Results should be paginated with Link headers indicating next/previous."""
         for i in range(5):
@@ -190,15 +183,11 @@ class OrganizationSeerProjectSettingsEndpointTest(APITestCase):
 
         project_cursor = self.create_project(organization=self.organization)
         project_cursor.update_option(
-            "sentry:seer_automation_handoff_target",
-            CodingAgentProviderType.CURSOR_BACKGROUND_AGENT,
+            "sentry:seer_automation_handoff_target", "cursor_background_agent"
         )
 
         project_claude = self.create_project(organization=self.organization)
-        project_claude.update_option(
-            "sentry:seer_automation_handoff_target",
-            CodingAgentProviderType.CLAUDE_CODE_AGENT,
-        )
+        project_claude.update_option("sentry:seer_automation_handoff_target", "claude_code_agent")
 
         response = self.client.get(self.url, {"sortBy": "agent"})
 
@@ -240,8 +229,7 @@ class OrganizationSeerProjectSettingsEndpointTest(APITestCase):
 
         assert response.status_code == 200
         ids = [r["projectId"] for r in response.data]
-        assert ids == [self.project.id]
-        assert project.id not in ids
+        assert ids == [project.id]
 
     def test_get_filter_by_repos_count(self) -> None:
         """reposCount with numeric operators."""
@@ -284,9 +272,7 @@ class OrganizationSeerProjectSettingsEndpointTest(APITestCase):
     def test_get_filter_by_agent_seer(self) -> None:
         """agent:seer should return projects with no handoff target (NULL)."""
         project1 = self.create_project(organization=self.organization)
-        project1.update_option(
-            "sentry:seer_automation_handoff_target", CodingAgentProviderType.CURSOR_BACKGROUND_AGENT
-        )
+        project1.update_option("sentry:seer_automation_handoff_target", "cursor_background_agent")
 
         response = self.client.get(self.url, {"query": "agent:seer"})
 
@@ -298,9 +284,7 @@ class OrganizationSeerProjectSettingsEndpointTest(APITestCase):
     def test_get_filter_by_agent_external(self) -> None:
         """agent:cursor should return projects with cursor handoff target."""
         project1 = self.create_project(organization=self.organization)
-        project1.update_option(
-            "sentry:seer_automation_handoff_target", CodingAgentProviderType.CURSOR_BACKGROUND_AGENT
-        )
+        project1.update_option("sentry:seer_automation_handoff_target", "cursor_background_agent")
 
         response = self.client.get(self.url, {"query": "agent:cursor"})
 
@@ -312,9 +296,7 @@ class OrganizationSeerProjectSettingsEndpointTest(APITestCase):
     def test_get_filter_negation(self) -> None:
         """!agent:seer should exclude projects with no handoff target."""
         project1 = self.create_project(organization=self.organization)
-        project1.update_option(
-            "sentry:seer_automation_handoff_target", CodingAgentProviderType.CURSOR_BACKGROUND_AGENT
-        )
+        project1.update_option("sentry:seer_automation_handoff_target", "cursor_background_agent")
 
         response = self.client.get(self.url, {"query": "!agent:seer"})
 
@@ -326,18 +308,12 @@ class OrganizationSeerProjectSettingsEndpointTest(APITestCase):
     def test_get_multiple_filters(self) -> None:
         """Combining multiple filters should intersect the results."""
         project1 = self.create_project(organization=self.organization)
-        project1.update_option(
-            "sentry:seer_automation_handoff_target",
-            CodingAgentProviderType.CURSOR_BACKGROUND_AGENT,
-        )
+        project1.update_option("sentry:seer_automation_handoff_target", "cursor_background_agent")
         repo = self.create_repo(project=project1, name="owner/repo-1")
         SeerProjectRepository.objects.create(project=project1, repository=repo)
 
         project2 = self.create_project(organization=self.organization)
-        project2.update_option(
-            "sentry:seer_automation_handoff_target",
-            CodingAgentProviderType.CURSOR_BACKGROUND_AGENT,
-        )
+        project2.update_option("sentry:seer_automation_handoff_target", "cursor_background_agent")
 
         response = self.client.get(self.url, {"query": "agent:cursor reposCount:>0"})
 

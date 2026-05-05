@@ -5,7 +5,7 @@ from collections.abc import Mapping, Sequence
 from functools import partial
 from typing import Any, TypedDict
 
-from django.db.models import Case, CharField, Count, OuterRef, Q, Subquery, Value, When
+from django.db.models import Case, CharField, Count, Func, OuterRef, Q, Subquery, Value, When
 from django.db.models.functions import Coalesce
 from rest_framework import serializers
 from rest_framework.request import Request
@@ -34,7 +34,6 @@ from sentry.seer.autofix.constants import (
     AutofixAutomationTuningSettings,
 )
 from sentry.seer.autofix.utils import (
-    CodingAgentProviderType,
     build_automation_handoff,
     get_valid_automated_run_stopping_points,
     update_seer_project_settings,
@@ -49,8 +48,8 @@ class CodingAgentAlias(enum.StrEnum):
 
 
 CODING_AGENT_HANDOFF_TARGET_TO_ALIAS: dict[str, CodingAgentAlias] = {
-    CodingAgentProviderType.CURSOR_BACKGROUND_AGENT: CodingAgentAlias.CURSOR,
-    CodingAgentProviderType.CLAUDE_CODE_AGENT: CodingAgentAlias.CLAUDE,
+    "cursor_background_agent": CodingAgentAlias.CURSOR,
+    "claude_code_agent": CodingAgentAlias.CLAUDE,
 }
 
 SORT_FIELDS_MAPPING: dict[str, str] = {
@@ -75,7 +74,7 @@ parse_search_query = partial(base_parse_search_query, config=search_config)
 class SeerProjectSettingsResponse(TypedDict):
     projectId: int
     projectSlug: str
-    agent: CodingAgentAlias
+    agent: str
     integrationId: str | None
     stoppingPoint: str
     scannerAutomation: bool
@@ -96,10 +95,10 @@ def _serialize_seer_project_settings(
     # No configured external handoff means use Seer agent.
     handoff = build_automation_handoff(attrs.get)
     if handoff is None:
-        agent: CodingAgentAlias = CodingAgentAlias.SEER
+        agent: str = "seer"
         integration_id: str | None = None
     else:
-        agent = CODING_AGENT_HANDOFF_TARGET_TO_ALIAS[handoff.target]
+        agent = CODING_AGENT_HANDOFF_TARGET_TO_ALIAS.get(handoff.target, handoff.target)
         integration_id = str(handoff.integration_id)
 
     return SeerProjectSettingsResponse(
@@ -165,9 +164,19 @@ def _get_attrs_for_project(project: Project) -> dict[str, Any]:
 
 
 def _annotate_queryset(queryset):
-    def _project_option_subquery(key: str) -> Subquery:
-        return Subquery(
-            ProjectOption.objects.filter(project_id=OuterRef("id"), key=key).values("value")[:1]
+    def _project_option_subquery(key: str) -> Func:
+        # ProjectOption.value is a LegacyTextJSONField (text column storing JSON).
+        # String values are stored with surrounding double-quotes (e.g. '"off"'),
+        # which breaks SQL-level comparisons. Strip them so downstream annotations
+        # and filters work with plain strings.
+        return Func(
+            Subquery(
+                ProjectOption.objects.filter(project_id=OuterRef("id"), key=key).values("value")[:1]
+            ),
+            Value('"'),
+            Value(""),
+            function="REPLACE",
+            output_field=CharField(),
         )
 
     return queryset.annotate(
@@ -178,24 +187,23 @@ def _annotate_queryset(queryset):
         _tuning=Coalesce(
             _project_option_subquery("sentry:autofix_automation_tuning"),
             Value(AUTOFIX_AUTOMATION_TUNING_DEFAULT),
+            output_field=CharField(),
         ),
         stopping_point=Case(
             When(_tuning=AutofixAutomationTuningSettings.OFF, then=Value("off")),
             default=Coalesce(
                 _project_option_subquery("sentry:seer_automated_run_stopping_point"),
                 Value(SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT),
+                output_field=CharField(),
             ),
             output_field=CharField(),
         ),
         _handoff_target=_project_option_subquery("sentry:seer_automation_handoff_target"),
         agent=Case(
-            # Convert raw handoff targets to their user-facing agent aliases.
-            # Loop so that this is maintainable in case we ever support more agents.
             *[
                 When(_handoff_target=target, then=Value(alias))
                 for target, alias in CODING_AGENT_HANDOFF_TARGET_TO_ALIAS.items()
             ],
-            # Null/missing handoff target (ie, no configured external handoff) means use Seer agent.
             default=Value(CodingAgentAlias.SEER),
             output_field=CharField(),
         ),
@@ -319,9 +327,9 @@ class OrganizationSeerProjectSettingsEndpoint(OrganizationEndpoint):
         if search_query:
             try:
                 search_filters = parse_search_query(search_query)
-            except InvalidSearchQuery as e:
-                return Response({"detail": str(e)}, status=400)
-            queryset = _apply_search_filters(queryset, search_filters)
+                queryset = _apply_search_filters(queryset, search_filters)
+            except (InvalidSearchQuery, ValueError):
+                return Response({"detail": "Invalid search query"}, status=400)
 
         def on_results(projects: list[Project]) -> list[SeerProjectSettingsResponse]:
             attrs_by_project = _get_attrs_for_projects(projects)
@@ -353,9 +361,9 @@ class OrganizationSeerProjectSettingsEndpoint(OrganizationEndpoint):
         if search_query:
             try:
                 filters = parse_search_query(search_query)
-            except InvalidSearchQuery as e:
-                return Response({"detail": str(e)}, status=400)
-            queryset = _apply_search_filters(queryset, filters)
+                queryset = _apply_search_filters(queryset, filters)
+            except (InvalidSearchQuery, ValueError):
+                return Response({"detail": "Invalid search query"}, status=400)
 
         projects = list(queryset)
         for project in projects:
