@@ -16,6 +16,7 @@ from urllib3 import BaseHTTPResponse, HTTPConnectionPool
 from sentry import features, options, projectoptions, ratelimits
 from sentry.constants import (
     AUTO_OPEN_PRS_DEFAULT,
+    AUTOFIX_AUTOMATION_TUNING_DEFAULT,
     SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT,
     DataCategory,
     ObjectStatus,
@@ -712,8 +713,22 @@ def bulk_read_preferences_from_sentry_db(
 
 def update_seer_project_settings(project: Project, data: dict[str, Any]) -> None:
     """Apply high-level Seer settings fields to a project."""
+
+    def _set(key: str, value: Any, default: Any) -> None:
+        """If we're trying to set a default, delete the option. Otherwise, set it."""
+        if value == default:
+            project.delete_option(key)
+        else:
+            project.update_option(key, value)
+
+    stopping_point: str | None = data.get("stoppingPoint")
+
     if "automationTuning" in data:
-        project.update_option("sentry:autofix_automation_tuning", data["automationTuning"])
+        _set(
+            "sentry:autofix_automation_tuning",
+            data["automationTuning"],
+            AUTOFIX_AUTOMATION_TUNING_DEFAULT,
+        )
 
     if "agent" in data:
         agent: str = data["agent"]
@@ -721,6 +736,7 @@ def update_seer_project_settings(project: Project, data: dict[str, Any]) -> None
             project.delete_option("sentry:seer_automation_handoff_point")
             project.delete_option("sentry:seer_automation_handoff_target")
             project.delete_option("sentry:seer_automation_handoff_integration_id")
+            project.delete_option("sentry:seer_automation_handoff_auto_create_pr")
         else:
             integration_id: int | None = data.get("integrationId")
             if integration_id is None:
@@ -734,19 +750,26 @@ def update_seer_project_settings(project: Project, data: dict[str, Any]) -> None
             )
             project.update_option("sentry:seer_automation_handoff_integration_id", integration_id)
 
-    if "stoppingPoint" in data:
-        stopping_point: str = data["stoppingPoint"]
-        project.update_option("sentry:seer_automated_run_stopping_point", stopping_point)
-        if stopping_point == "open_pr":
-            project.update_option("sentry:seer_automation_handoff_auto_create_pr", True)
-        else:
-            project.delete_option("sentry:seer_automation_handoff_auto_create_pr")
+            # Check stopping point to see if we can auto create PRs.
+            if stopping_point is not None:
+                _set(
+                    "sentry:seer_automation_handoff_auto_create_pr",
+                    stopping_point == "open_pr",
+                    False,
+                )
+
+    if stopping_point is not None:
+        _set(
+            "sentry:seer_automated_run_stopping_point",
+            stopping_point,
+            SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT,
+        )
 
     if "scannerAutomation" in data:
-        project.update_option("sentry:seer_scanner_automation", data["scannerAutomation"])
+        _set("sentry:seer_scanner_automation", data["scannerAutomation"], True)
 
     if "nightshiftTweaks" in data:
-        project.update_option("sentry:seer_nightshift_tweaks", data["nightshiftTweaks"])
+        _set("sentry:seer_nightshift_tweaks", data["nightshiftTweaks"], None)
 
 
 def has_project_connected_repos(organization: Organization, project: Project) -> bool:

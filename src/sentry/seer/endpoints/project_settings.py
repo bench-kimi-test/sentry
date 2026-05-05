@@ -295,7 +295,7 @@ class ProjectSettingsUpdateSerializer(serializers.Serializer):
     def validate(self, data):
         agent = data.get("agent")
 
-        if agent not in (None, "seer") and "integrationId" not in data:
+        if agent not in (None, "none", "seer") and "integrationId" not in data:
             raise serializers.ValidationError(
                 {"integrationId": "Required when agent is an external coding agent."}
             )
