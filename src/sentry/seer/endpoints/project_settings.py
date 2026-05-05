@@ -20,13 +20,17 @@ from sentry.api.bases.project import ProjectEndpoint, ProjectEventPermission
 from sentry.api.event_search import QueryToken, SearchConfig, SearchFilter
 from sentry.api.event_search import parse_search_query as base_parse_search_query
 from sentry.api.paginator import OffsetPaginator
-from sentry.constants import SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT, ObjectStatus
+from sentry.constants import (
+    AUTOFIX_AUTOMATION_TUNING_DEFAULT,
+    SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT,
+    ObjectStatus,
+)
 from sentry.exceptions import InvalidSearchQuery
 from sentry.models.options.project_option import ProjectOption
 from sentry.models.organization import Organization
 from sentry.models.project import Project
 from sentry.projectoptions.defaults import SEER_PROJECT_PREFERENCE_OPTION_KEYS
-from sentry.seer.autofix.constants import AutofixAutomationTuningSettings
+from sentry.seer.autofix.constants import ALIAS_TO_CODING_AGENT, AutofixAutomationTuningSettings
 from sentry.seer.autofix.utils import (
     CodingAgentProviderType,
     build_automation_handoff,
@@ -37,7 +41,6 @@ from sentry.seer.models.project_repository import SeerProjectRepository
 
 
 class CodingAgentAlias(enum.StrEnum):
-    NONE = "none"
     SEER = "seer"
     CURSOR = "cursor"
     CLAUDE = "claude"
@@ -68,7 +71,6 @@ parse_search_query = partial(base_parse_search_query, config=search_config)
 class SeerProjectSettingsResponse(TypedDict):
     projectId: int
     projectSlug: str
-    tuning: str
     agent: CodingAgentAlias
     integrationId: str | None
     stoppingPoint: str
@@ -80,17 +82,17 @@ class SeerProjectSettingsResponse(TypedDict):
 def _serialize_project_settings(
     project: Project, attrs: dict[str, Any]
 ) -> SeerProjectSettingsResponse:
-    tuning: str = attrs["sentry:autofix_automation_tuning"]
+    # Only use the real stopping point if tuning is on.
+    tuning = attrs["sentry:autofix_automation_tuning"]
+    stopping_point = (
+        "off"
+        if tuning == AutofixAutomationTuningSettings.OFF
+        else attrs["sentry:seer_automated_run_stopping_point"]
+    )
 
-    # Automation tuning takes precedence over the actual stopping point.
-    if tuning == AutofixAutomationTuningSettings.OFF:
-        stopping_point = "off"
-    else:
-        stopping_point = attrs["sentry:seer_automated_run_stopping_point"]
-
-    # Automation tuning takes precedence over the actual handoff configuration.
+    # No configured external handoff -> Seer agent.
     handoff = build_automation_handoff(attrs.get)
-    if tuning == AutofixAutomationTuningSettings.OFF or handoff is None:
+    if handoff is None:
         agent: CodingAgentAlias = CodingAgentAlias.SEER
         integration_id: str | None = None
     else:
@@ -100,7 +102,6 @@ def _serialize_project_settings(
     return SeerProjectSettingsResponse(
         projectId=project.id,
         projectSlug=project.slug,
-        tuning=tuning,
         agent=agent,
         integrationId=integration_id,
         stoppingPoint=stopping_point,
@@ -125,8 +126,7 @@ def _get_attrs_for_projects(
 
     repo_counts: dict[int, int] = dict(
         SeerProjectRepository.objects.filter(
-            project_id__in=project_ids,
-            repository__status=ObjectStatus.ACTIVE,
+            project_id__in=project_ids, repository__status=ObjectStatus.ACTIVE
         )
         .values_list("project_id")
         .annotate(count=Count("id"))
@@ -222,10 +222,18 @@ def _apply_search_filters(queryset, filters: Sequence[QueryToken]):
 
         elif key == "stoppingPoint":
             queryset = queryset.annotate(
-                stopping_point=Coalesce(
-                    _project_option_subquery("sentry:seer_automated_run_stopping_point"),
-                    Value(SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT),
-                )
+                _tuning=Coalesce(
+                    _project_option_subquery("sentry:autofix_automation_tuning"),
+                    Value(AUTOFIX_AUTOMATION_TUNING_DEFAULT),
+                ),
+                stopping_point=Case(
+                    When(_tuning=AutofixAutomationTuningSettings.OFF, then=Value("off")),
+                    default=Coalesce(
+                        _project_option_subquery("sentry:seer_automated_run_stopping_point"),
+                        Value(SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT),
+                    ),
+                    output_field=CharField(),
+                ),
             )
             if op == "=":
                 queryset = queryset.filter(stopping_point=value)
@@ -233,35 +241,20 @@ def _apply_search_filters(queryset, filters: Sequence[QueryToken]):
                 queryset = queryset.exclude(stopping_point=value)
 
         elif key == "agent":
-            # Agent depends on autofix_automation_tuning and whether we have
-            # an external handoff target (eg, Cursor or Claude) or just use Seer.
             queryset = queryset.annotate(
-                _tuning=Coalesce(
-                    _project_option_subquery("sentry:autofix_automation_tuning"),
-                    Value(AutofixAutomationTuningSettings.OFF),
-                ),
-                _handoff_target=_project_option_subquery("sentry:seer_automation_handoff_target"),
-                agent=Case(
-                    # No automation -> no agent.
-                    When(_tuning=AutofixAutomationTuningSettings.OFF, then=Value("none")),
-                    # Automation on, look for external handoff targets.
-                    When(
-                        _handoff_target=CodingAgentProviderType.CURSOR_BACKGROUND_AGENT,
-                        then=Value("cursor"),
-                    ),
-                    When(
-                        _handoff_target=CodingAgentProviderType.CLAUDE_CODE_AGENT,
-                        then=Value("claude"),
-                    ),
-                    # Automation on but no handoff target -> Seer agent.
-                    default=Value("seer"),
-                    output_field=CharField(),
-                ),
+                handoff_target=_project_option_subquery("sentry:seer_automation_handoff_target"),
             )
+
+            target = ALIAS_TO_CODING_AGENT.get(value)
+            if target is None:  # Null target/handoff means Seer agent.
+                q = Q(handoff_target__isnull=True)
+            else:
+                q = Q(handoff_target=target)
+
             if op == "=":
-                queryset = queryset.filter(agent=value)
+                queryset = queryset.filter(q)
             elif op == "!=":
-                queryset = queryset.exclude(agent=value)
+                queryset = queryset.exclude(q)
 
     return queryset
 
@@ -275,40 +268,31 @@ class NightshiftTweaksSerializer(serializers.Serializer):
 
 
 class ProjectSettingsUpdateSerializer(serializers.Serializer):
-    automationTuning = serializers.ChoiceField(
-        choices=["off", "low", "medium", "high", "always"], required=False
-    )
     agent = serializers.ChoiceField(choices=["seer", "cursor", "claude"], required=False)
     integrationId = serializers.IntegerField(required=False)
     stoppingPoint = serializers.ChoiceField(
-        choices=["root_cause", "code_changes", "open_pr"], required=False
+        choices=["off", "root_cause", "code_changes", "open_pr"], required=False
     )
     scannerAutomation = serializers.BooleanField(required=False)
     nightshiftTweaks = NightshiftTweaksSerializer(required=False, allow_null=True)
 
     def validate_stoppingPoint(self, value: str) -> str:
+        if value == "off":
+            return value
+
         organization = self.context["organization"]
         if value not in get_valid_automated_run_stopping_points(organization):
             raise serializers.ValidationError(f'"{value}" is not a valid choice.')
         return value
 
     def validate(self, data):
-        agent = data.get("agent")
-
-        if agent not in (None, "none", "seer") and "integrationId" not in data:
+        if data.get("agent") != "seer" and "integrationId" not in data:
             raise serializers.ValidationError(
                 {"integrationId": "Required when agent is an external coding agent."}
             )
 
         has_update = any(
-            k in data
-            for k in (
-                "automationTuning",
-                "agent",
-                "stoppingPoint",
-                "scannerAutomation",
-                "nightshiftTweaks",
-            )
+            k in data for k in ("agent", "stoppingPoint", "scannerAutomation", "nightshiftTweaks")
         )
         if not has_update:
             raise serializers.ValidationError("At least one update field must be provided.")
