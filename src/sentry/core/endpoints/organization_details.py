@@ -106,7 +106,10 @@ from sentry.organizations.services.organization.model import (
 )
 from sentry.relay.datascrubbing import validate_pii_config_update, validate_pii_selectors
 from sentry.replays.models import OrganizationMemberReplayAccess
-from sentry.seer.autofix.constants import ALIAS_TO_CODING_AGENT, AutofixAutomationTuningSettings
+from sentry.seer.autofix.constants import (
+    CODING_AGENT_ALIAS_TO_HANDOFF_TARGET,
+    AutofixAutomationTuningSettings,
+)
 from sentry.seer.autofix.utils import get_valid_automated_run_stopping_points
 from sentry.services.organization.provisioning import organization_provisioning_service
 from sentry.tasks.console_platform_cleanup import remove_inaccessible_console_platform_sources
@@ -386,7 +389,7 @@ class OrganizationSerializer(BaseOrganizationSerializer):
     def validate_defaultCodingAgent(self, value: str | None) -> str:
         if value is None:
             return SEER_DEFAULT_CODING_AGENT_DEFAULT
-        return ALIAS_TO_CODING_AGENT.get(value, value)
+        return CODING_AGENT_ALIAS_TO_HANDOFF_TARGET.get(value, value)
 
     def validate_defaultCodingAgentIntegrationId(self, value: int | None) -> int | None:
         if value is None:

@@ -1,0 +1,518 @@
+from django.urls import reverse
+
+from sentry.constants import ObjectStatus
+from sentry.seer.autofix.constants import AutofixAutomationTuningSettings
+from sentry.seer.autofix.utils import CodingAgentProviderType
+from sentry.seer.models import AutofixHandoffPoint
+from sentry.seer.models.project_repository import SeerProjectRepository
+from sentry.testutils.cases import APITestCase
+
+
+class OrganizationSeerProjectSettingsEndpointTest(APITestCase):
+    endpoint = "sentry-api-0-organization-seer-project-settings"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.login_as(user=self.user)
+        self.project = self.create_project(organization=self.organization)
+        self.url = reverse(
+            self.endpoint,
+            kwargs={"organization_id_or_slug": self.organization.slug},
+        )
+
+    def test_get_returns_defaults(self) -> None:
+        """Projects with no options set should return default values."""
+        response = self.client.get(self.url)
+
+        assert response.status_code == 200
+        assert len(response.data) == 1
+        assert response.data[0] == {
+            "projectId": self.project.id,
+            "projectSlug": self.project.slug,
+            "agent": "seer",
+            "integrationId": None,
+            "stoppingPoint": "off",
+            "scannerAutomation": True,
+            "reposCount": 0,
+        }
+
+    def test_get_returns_configured_project_options(self) -> None:
+        """Projects with explicit option values should reflect those in the response."""
+        self.project.update_option(
+            "sentry:autofix_automation_tuning", AutofixAutomationTuningSettings.MEDIUM
+        )
+        self.project.update_option("sentry:seer_automated_run_stopping_point", "open_pr")
+        self.project.update_option("sentry:seer_scanner_automation", False)
+
+        response = self.client.get(self.url)
+
+        assert response.status_code == 200
+        assert response.data[0]["stoppingPoint"] == "open_pr"
+        assert response.data[0]["scannerAutomation"] is False
+
+    def test_get_returns_external_agent_with_integration_id(self) -> None:
+        """A project configured with an external handoff target should return
+        the alias and integration ID."""
+        self.project.update_option(
+            "sentry:seer_automation_handoff_target", CodingAgentProviderType.CURSOR_BACKGROUND_AGENT
+        )
+        self.project.update_option(
+            "sentry:seer_automation_handoff_point", AutofixHandoffPoint.ROOT_CAUSE
+        )
+        self.project.update_option("sentry:seer_automation_handoff_integration_id", 42)
+
+        response = self.client.get(self.url)
+
+        assert response.status_code == 200
+        assert response.data[0]["agent"] == "cursor"
+        assert response.data[0]["integrationId"] == "42"
+
+    def test_get_stopping_point_off_when_tuning_off(self) -> None:
+        """When tuning is OFF, stoppingPoint should be 'off' regardless of the
+        stored seer_automated_run_stopping_point value."""
+        self.project.update_option(
+            "sentry:autofix_automation_tuning", AutofixAutomationTuningSettings.OFF
+        )
+        self.project.update_option("sentry:seer_automated_run_stopping_point", "open_pr")
+
+        response = self.client.get(self.url)
+
+        assert response.status_code == 200
+        assert response.data[0]["stoppingPoint"] == "off"
+
+    def test_get_stopping_point_when_tuning_on(self) -> None:
+        """When tuning is not OFF, stoppingPoint should reflect the stored value."""
+        self.project.update_option(
+            "sentry:autofix_automation_tuning", AutofixAutomationTuningSettings.MEDIUM
+        )
+        self.project.update_option("sentry:seer_automated_run_stopping_point", "root_cause")
+
+        response = self.client.get(self.url)
+
+        assert response.status_code == 200
+        assert response.data[0]["stoppingPoint"] == "root_cause"
+
+    def test_get_repos_count(self) -> None:
+        """reposCount should reflect the number of active SeerProjectRepository rows."""
+        repo1 = self.create_repo(project=self.project, name="owner/repo-1")
+        repo2 = self.create_repo(project=self.project, name="owner/repo-2")
+        SeerProjectRepository.objects.create(project=self.project, repository=repo1)
+        SeerProjectRepository.objects.create(project=self.project, repository=repo2)
+
+        response = self.client.get(self.url)
+
+        assert response.status_code == 200
+        assert response.data[0]["reposCount"] == 2
+
+    def test_get_repos_count_excludes_inactive_repos(self) -> None:
+        """Repos with non-active status should not be counted."""
+        active_repo = self.create_repo(project=self.project, name="owner/active")
+        disabled_repo = self.create_repo(project=self.project, name="owner/deleted")
+        disabled_repo.status = ObjectStatus.DISABLED
+        disabled_repo.save()
+        SeerProjectRepository.objects.create(project=self.project, repository=active_repo)
+        SeerProjectRepository.objects.create(project=self.project, repository=disabled_repo)
+
+        response = self.client.get(self.url)
+
+        assert response.status_code == 200
+        assert response.data[0]["reposCount"] == 1
+
+    def test_get_only_returns_accessible_projects(self) -> None:
+        """Response should only include projects the user has access to."""
+        self.organization.flags.allow_joinleave = False
+        self.organization.save()
+
+        team = self.create_team(organization=self.organization)
+        self.create_project(organization=self.organization, teams=[team])
+        inaccessible_project = self.create_project(organization=self.organization)
+
+        member = self.create_user()
+        self.create_member(user=member, organization=self.organization, role="member", teams=[team])
+        self.login_as(user=member)
+
+        response = self.client.get(self.url)
+
+        assert response.status_code == 200
+        project_ids = [r["projectId"] for r in response.data]
+        assert len(project_ids) == 1
+        assert inaccessible_project.id not in project_ids
+
+    def test_get_unauthenticated_returns_401(self) -> None:
+        """Unauthenticated requests should be rejected."""
+        self.client.logout()
+        response = self.client.get(self.url)
+        assert response.status_code == 401
+
+    def test_get_paginates_results(self) -> None:
+        """Results should be paginated with Link headers indicating next/previous."""
+        for i in range(5):
+            self.create_project(organization=self.organization, slug=f"paginate-{i}")
+
+        response1 = self.client.get(self.url, {"per_page": "3"})
+        assert response1.status_code == 200
+        assert len(response1.data) == 3
+        assert 'rel="next"; results="true"' in response1.headers["Link"]
+
+        response2 = self.client.get(self.url, {"per_page": "3", "cursor": "3:1:0"})
+        assert response2.status_code == 200
+        assert 'rel="previous"; results="true"' in response2.headers["Link"]
+        assert 'rel="next"; results="false"' in response2.headers["Link"]
+
+    def test_get_sort_by_name(self) -> None:
+        """sortBy=name should order by project slug."""
+        project_b = self.create_project(organization=self.organization, slug="banana")
+        project_a = self.create_project(organization=self.organization, slug="apple")
+
+        response = self.client.get(self.url, {"sortBy": "name"})
+
+        assert response.status_code == 200
+        slugs = [r["projectSlug"] for r in response.data]
+        assert slugs.index(project_a.slug) < slugs.index(project_b.slug)
+
+    def test_get_sort_by_repos_count(self) -> None:
+        """sortBy=reposCount should order by SeerProjectRepository count."""
+        project1 = self.create_project(organization=self.organization)
+        for i in range(2):
+            repo = self.create_repo(project=project1, name=f"owner/repo-{i}")
+            SeerProjectRepository.objects.create(project=project1, repository=repo)
+        project2 = self.create_project(organization=self.organization)
+
+        response = self.client.get(self.url, {"sortBy": "reposCount"})
+
+        assert response.status_code == 200
+        ids = [r["projectId"] for r in response.data]
+        assert ids.index(project2.id) < ids.index(project1.id)
+
+    def test_get_sort_by_agent(self) -> None:
+        """sortBy=agent should order alphabetically by agent alias."""
+        project_seer = self.create_project(organization=self.organization)
+
+        project_cursor = self.create_project(organization=self.organization)
+        project_cursor.update_option(
+            "sentry:seer_automation_handoff_target",
+            CodingAgentProviderType.CURSOR_BACKGROUND_AGENT,
+        )
+
+        project_claude = self.create_project(organization=self.organization)
+        project_claude.update_option(
+            "sentry:seer_automation_handoff_target",
+            CodingAgentProviderType.CLAUDE_CODE_AGENT,
+        )
+
+        response = self.client.get(self.url, {"sortBy": "agent"})
+
+        assert response.status_code == 200
+        ids = [r["projectId"] for r in response.data]
+        assert ids.index(project_claude.id) < ids.index(project_cursor.id)
+        assert ids.index(project_cursor.id) < ids.index(project_seer.id)
+
+    def test_get_sort_by_invalid_field_returns_400(self) -> None:
+        """An unrecognized sortBy value should return 400."""
+        response = self.client.get(self.url, {"sortBy": "invalid"})
+        assert response.status_code == 400
+
+    def test_get_filter_by_free_text_name(self) -> None:
+        """Free text query should match against both name and slug."""
+        project1 = self.create_project(
+            organization=self.organization, name="", slug="matching-slug"
+        )
+        project2 = self.create_project(
+            organization=self.organization, name="Matching Name", slug=""
+        )
+        project3 = self.create_project(organization=self.organization)
+
+        response = self.client.get(self.url, {"query": "matching"})
+
+        assert response.status_code == 200
+        ids = [r["projectId"] for r in response.data]
+        assert len(ids) == 2
+        assert project1.id in ids
+        assert project2.id in ids
+        assert project3.id not in ids
+
+    def test_get_filter_by_id(self) -> None:
+        """id:N should return only the project with that ID."""
+        self.create_project(organization=self.organization)
+        project = self.create_project(organization=self.organization)
+
+        response = self.client.get(self.url, {"query": f"id:{project.id}"})
+
+        assert response.status_code == 200
+        ids = [r["projectId"] for r in response.data]
+        assert ids == [self.project.id]
+        assert project.id not in ids
+
+    def test_get_filter_by_repos_count(self) -> None:
+        """reposCount with numeric operators."""
+        project1 = self.create_project(organization=self.organization)
+        for i in range(2):
+            repo = self.create_repo(project=project1, name=f"owner/filter-repo-{i}")
+            SeerProjectRepository.objects.create(project=project1, repository=repo)
+        project2 = self.create_project(organization=self.organization)
+
+        response = self.client.get(self.url, {"query": "reposCount:>0"})
+        assert response.status_code == 200
+        ids = [r["projectId"] for r in response.data]
+        assert project1.id in ids
+        assert project2.id not in ids
+
+        response = self.client.get(self.url, {"query": "reposCount:0"})
+        ids = [r["projectId"] for r in response.data]
+        assert project2.id in ids
+        assert project1.id not in ids
+
+    def test_get_filter_by_stopping_point(self) -> None:
+        """stoppingPoint filter should account for tuning state."""
+        project1 = self.create_project(organization=self.organization)
+        project1.update_option(
+            "sentry:autofix_automation_tuning", AutofixAutomationTuningSettings.MEDIUM
+        )
+        project1.update_option("sentry:seer_automated_run_stopping_point", "code_changes")
+
+        response = self.client.get(self.url, {"query": "stoppingPoint:off"})
+        assert response.status_code == 200
+        ids = [r["projectId"] for r in response.data]
+        assert self.project.id in ids
+        assert project1.id not in ids
+
+        response = self.client.get(self.url, {"query": "stoppingPoint:code_changes"})
+        ids = [r["projectId"] for r in response.data]
+        assert project1.id in ids
+        assert self.project.id not in ids
+
+    def test_get_filter_by_agent_seer(self) -> None:
+        """agent:seer should return projects with no handoff target (NULL)."""
+        project1 = self.create_project(organization=self.organization)
+        project1.update_option(
+            "sentry:seer_automation_handoff_target", CodingAgentProviderType.CURSOR_BACKGROUND_AGENT
+        )
+
+        response = self.client.get(self.url, {"query": "agent:seer"})
+
+        assert response.status_code == 200
+        ids = [r["projectId"] for r in response.data]
+        assert self.project.id in ids
+        assert project1.id not in ids
+
+    def test_get_filter_by_agent_external(self) -> None:
+        """agent:cursor should return projects with cursor handoff target."""
+        project1 = self.create_project(organization=self.organization)
+        project1.update_option(
+            "sentry:seer_automation_handoff_target", CodingAgentProviderType.CURSOR_BACKGROUND_AGENT
+        )
+
+        response = self.client.get(self.url, {"query": "agent:cursor"})
+
+        assert response.status_code == 200
+        ids = [r["projectId"] for r in response.data]
+        assert project1.id in ids
+        assert self.project.id not in ids
+
+    def test_get_filter_negation(self) -> None:
+        """!agent:seer should exclude projects with no handoff target."""
+        project1 = self.create_project(organization=self.organization)
+        project1.update_option(
+            "sentry:seer_automation_handoff_target", CodingAgentProviderType.CURSOR_BACKGROUND_AGENT
+        )
+
+        response = self.client.get(self.url, {"query": "!agent:seer"})
+
+        assert response.status_code == 200
+        ids = [r["projectId"] for r in response.data]
+        assert project1.id in ids
+        assert self.project.id not in ids
+
+    def test_get_multiple_filters(self) -> None:
+        """Combining multiple filters should intersect the results."""
+        project1 = self.create_project(organization=self.organization)
+        project1.update_option(
+            "sentry:seer_automation_handoff_target",
+            CodingAgentProviderType.CURSOR_BACKGROUND_AGENT,
+        )
+        repo = self.create_repo(project=project1, name="owner/repo-1")
+        SeerProjectRepository.objects.create(project=project1, repository=repo)
+
+        project2 = self.create_project(organization=self.organization)
+        project2.update_option(
+            "sentry:seer_automation_handoff_target",
+            CodingAgentProviderType.CURSOR_BACKGROUND_AGENT,
+        )
+
+        response = self.client.get(self.url, {"query": "agent:cursor reposCount:>0"})
+
+        assert response.status_code == 200
+        ids = [r["projectId"] for r in response.data]
+        assert ids == [project1.id]
+
+    def test_get_invalid_search_query_returns_400(self) -> None:
+        """A malformed search query should return 400 with detail."""
+        response = self.client.get(self.url, {"query": "bogusKey:value"})
+        assert response.status_code == 400
+        assert "detail" in response.data
+
+    # ── PUT: bulk update ─────────────────────────────────────────────
+
+    def test_put_empty_query_updates_all_projects(self) -> None:
+        """Omitting or sending an empty query should update all accessible projects."""
+        raise NotImplementedError
+
+    def test_put_updates_agent_to_seer(self) -> None:
+        """Setting agent=seer should clear all handoff options."""
+        raise NotImplementedError
+
+    def test_put_updates_agent_to_external_handoff(self) -> None:
+        """Setting agent=cursor with integrationId should set handoff options."""
+        raise NotImplementedError
+
+    def test_put_updates_stopping_point_off(self) -> None:
+        """stoppingPoint=off should set tuning to OFF."""
+        raise NotImplementedError
+
+    def test_put_updates_stopping_point(self) -> None:
+        """stoppingPoint=code_changes should set tuning to MEDIUM and store the value."""
+        raise NotImplementedError
+
+    def test_put_updates_scanner_automation(self) -> None:
+        """scannerAutomation=false should update the project option."""
+        raise NotImplementedError
+
+    def test_put_deletes_option_when_value_is_default(self) -> None:
+        """Setting a value equal to its registered default should delete the ProjectOption row."""
+        raise NotImplementedError
+
+    def test_put_applies_to_filtered_projects_only(self) -> None:
+        """The query parameter should scope which projects get updated."""
+        raise NotImplementedError
+
+    def test_put_excludes_inaccessible_projects(self) -> None:
+        """Bulk update should only touch projects the user has access to."""
+        raise NotImplementedError
+
+    # ── PUT: validation ──────────────────────────────────────────────
+
+    def test_put_requires_at_least_one_update_field(self) -> None:
+        """Sending only query with no update fields should return 400."""
+        raise NotImplementedError
+
+    def test_put_requires_integration_id_for_external_agent(self) -> None:
+        """agent=cursor without integrationId should return 400."""
+        raise NotImplementedError
+
+    def test_put_rejects_invalid_agent(self) -> None:
+        """An unrecognized agent value should return 400."""
+        raise NotImplementedError
+
+    def test_put_rejects_invalid_stopping_point(self) -> None:
+        """An unrecognized stoppingPoint value should return 400."""
+        raise NotImplementedError
+
+    def test_put_invalid_search_query_returns_400(self) -> None:
+        """A malformed query value should return 400."""
+        raise NotImplementedError
+
+    # ── PUT: audit log ───────────────────────────────────────────────
+
+    def test_put_creates_audit_log_entry(self) -> None:
+        """Bulk update should create an audit log entry with project count and IDs."""
+        raise NotImplementedError
+
+
+class ProjectSeerSettingsEndpointTest(APITestCase):
+    endpoint = "sentry-api-0-project-seer-settings"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.login_as(user=self.user)
+        self.project = self.create_project(organization=self.organization)
+        self.url = reverse(
+            self.endpoint,
+            kwargs={
+                "organization_id_or_slug": self.organization.slug,
+                "project_id_or_slug": self.project.slug,
+            },
+        )
+
+    # ── GET ──────────────────────────────────────────────────────────
+
+    def test_get_returns_default_settings(self) -> None:
+        """A project with no options set should return defaults."""
+        raise NotImplementedError
+
+    def test_get_returns_configured_settings(self) -> None:
+        """A project with explicit options should reflect them in the response."""
+        raise NotImplementedError
+
+    def test_get_returns_external_agent(self) -> None:
+        """A project with an external handoff should return the agent alias and integration ID."""
+        raise NotImplementedError
+
+    def test_get_stopping_point_off_when_tuning_off(self) -> None:
+        """stoppingPoint should be 'off' when tuning is OFF."""
+        raise NotImplementedError
+
+    def test_get_repos_count(self) -> None:
+        """reposCount should reflect active SeerProjectRepository rows."""
+        raise NotImplementedError
+
+    # ── PUT ──────────────────────────────────────────────────────────
+
+    def test_put_updates_agent_to_seer(self) -> None:
+        """Setting agent=seer should clear handoff options and return updated settings."""
+        raise NotImplementedError
+
+    def test_put_updates_agent_to_external(self) -> None:
+        """Setting agent=cursor with integrationId should set handoff options."""
+        raise NotImplementedError
+
+    def test_put_updates_stopping_point(self) -> None:
+        """stoppingPoint should update tuning and stopping point options."""
+        raise NotImplementedError
+
+    def test_put_updates_scanner_automation(self) -> None:
+        """scannerAutomation should update the project option."""
+        raise NotImplementedError
+
+    def test_put_updates_single_field_without_affecting_others(self) -> None:
+        """Sending only one field should not reset other settings."""
+        raise NotImplementedError
+
+    def test_put_returns_updated_settings(self) -> None:
+        """PUT response should contain the full updated settings object."""
+        raise NotImplementedError
+
+    def test_put_deletes_option_when_value_is_default(self) -> None:
+        """Setting a value to its default should delete the ProjectOption row."""
+        raise NotImplementedError
+
+    def test_put_sets_auto_create_pr_for_external_agent_with_open_pr(self) -> None:
+        """External agent + stoppingPoint=open_pr should set auto_create_pr=True."""
+        raise NotImplementedError
+
+    # ── PUT: validation ──────────────────────────────────────────────
+
+    def test_put_requires_at_least_one_update_field(self) -> None:
+        """Sending no update fields should return 400."""
+        raise NotImplementedError
+
+    def test_put_requires_integration_id_for_external_agent(self) -> None:
+        """agent=cursor without integrationId should return 400."""
+        raise NotImplementedError
+
+    def test_put_seer_agent_does_not_require_integration_id(self) -> None:
+        """agent=seer should not require integrationId."""
+        raise NotImplementedError
+
+    def test_put_rejects_invalid_agent(self) -> None:
+        """An unrecognized agent value should return 400."""
+        raise NotImplementedError
+
+    def test_put_rejects_invalid_stopping_point(self) -> None:
+        """An unrecognized stoppingPoint value should return 400."""
+        raise NotImplementedError
+
+    # ── PUT: audit log ───────────────────────────────────────────────
+
+    def test_put_creates_audit_log_entry(self) -> None:
+        """PUT should create an audit log entry with the project ID."""
+        raise NotImplementedError

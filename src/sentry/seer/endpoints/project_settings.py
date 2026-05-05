@@ -30,7 +30,9 @@ from sentry.models.options.project_option import ProjectOption
 from sentry.models.organization import Organization
 from sentry.models.project import Project
 from sentry.projectoptions.defaults import SEER_PROJECT_PREFERENCE_OPTION_KEYS
-from sentry.seer.autofix.constants import ALIAS_TO_CODING_AGENT, AutofixAutomationTuningSettings
+from sentry.seer.autofix.constants import (
+    AutofixAutomationTuningSettings,
+)
 from sentry.seer.autofix.utils import (
     CodingAgentProviderType,
     build_automation_handoff,
@@ -46,7 +48,7 @@ class CodingAgentAlias(enum.StrEnum):
     CLAUDE = "claude"
 
 
-CODING_AGENT_TO_ALIAS: dict[str, CodingAgentAlias] = {
+CODING_AGENT_HANDOFF_TARGET_TO_ALIAS: dict[str, CodingAgentAlias] = {
     CodingAgentProviderType.CURSOR_BACKGROUND_AGENT: CodingAgentAlias.CURSOR,
     CodingAgentProviderType.CLAUDE_CODE_AGENT: CodingAgentAlias.CLAUDE,
 }
@@ -56,10 +58,8 @@ SORT_FIELDS_MAPPING: dict[str, str] = {
     "-name": "-slug",
     "reposCount": "repos_count",
     "-reposCount": "-repos_count",
-    "stoppingPoint": "stopping_point",
-    "-stoppingPoint": "-stopping_point",
-    "agent": "handoff_target",
-    "-agent": "-handoff_target",
+    "agent": "agent",
+    "-agent": "-agent",
 }
 
 search_config = SearchConfig.create_from(
@@ -93,13 +93,13 @@ def _serialize_seer_project_settings(
         else attrs["sentry:seer_automated_run_stopping_point"]
     )
 
-    # No configured external handoff -> Seer agent.
+    # No configured external handoff means use Seer agent.
     handoff = build_automation_handoff(attrs.get)
     if handoff is None:
         agent: CodingAgentAlias = CodingAgentAlias.SEER
         integration_id: str | None = None
     else:
-        agent = CODING_AGENT_TO_ALIAS[handoff.target]
+        agent = CODING_AGENT_HANDOFF_TARGET_TO_ALIAS[handoff.target]
         integration_id = str(handoff.integration_id)
 
     return SeerProjectSettingsResponse(
@@ -187,7 +187,18 @@ def _annotate_queryset(queryset):
             ),
             output_field=CharField(),
         ),
-        handoff_target=_project_option_subquery("sentry:seer_automation_handoff_target"),
+        _handoff_target=_project_option_subquery("sentry:seer_automation_handoff_target"),
+        agent=Case(
+            # Convert raw handoff targets to their user-facing agent aliases.
+            # Loop so that this is maintainable in case we ever support more agents.
+            *[
+                When(_handoff_target=target, then=Value(alias))
+                for target, alias in CODING_AGENT_HANDOFF_TARGET_TO_ALIAS.items()
+            ],
+            # Null/missing handoff target (ie, no configured external handoff) means use Seer agent.
+            default=Value(CodingAgentAlias.SEER),
+            output_field=CharField(),
+        ),
     )
 
 
@@ -214,7 +225,7 @@ def _apply_search_filters(queryset, filters: Sequence[QueryToken]):
             if op == "=":
                 queryset = queryset.filter(Q(name__icontains=value) | Q(slug__icontains=value))
             elif op == "!=":
-                queryset = queryset.exclude(Q(name__icontains=value) & Q(slug__icontains=value))
+                queryset = queryset.exclude(Q(name__icontains=value) | Q(slug__icontains=value))
 
         elif key == "reposCount":
             count = int(value)
@@ -238,16 +249,10 @@ def _apply_search_filters(queryset, filters: Sequence[QueryToken]):
                 queryset = queryset.exclude(stopping_point=value)
 
         elif key == "agent":
-            target = ALIAS_TO_CODING_AGENT.get(value, value)
-            if target == "seer":
-                q = Q(handoff_target__isnull=True)
-            else:
-                q = Q(handoff_target=target)
-
             if op == "=":
-                queryset = queryset.filter(q)
+                queryset = queryset.filter(agent=value)
             elif op == "!=":
-                queryset = queryset.exclude(q)
+                queryset = queryset.exclude(agent=value)
 
     return queryset
 
@@ -283,7 +288,7 @@ class ProjectSettingsUpdateSerializer(serializers.Serializer):
 
 
 class BulkProjectSettingsUpdateSerializer(ProjectSettingsUpdateSerializer):
-    query = serializers.CharField(required=True)
+    query = serializers.CharField(required=False, default="")
 
     def validate(self, data):
         return super().validate(data)

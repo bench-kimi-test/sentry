@@ -33,7 +33,7 @@ from sentry.models.repository import Repository
 from sentry.net.http import connection_from_url
 from sentry.projectoptions.defaults import SEER_PROJECT_PREFERENCE_OPTION_KEYS
 from sentry.seer.autofix.constants import (
-    ALIAS_TO_CODING_AGENT,
+    CODING_AGENT_ALIAS_TO_HANDOFF_TARGET,
     AutofixAutomationTuningSettings,
     AutofixStatus,
 )
@@ -740,7 +740,8 @@ def update_seer_project_settings(project: Project, data: dict[str, Any]) -> None
                 "sentry:seer_automation_handoff_point", AutofixHandoffPoint.ROOT_CAUSE
             )
             project.update_option(
-                "sentry:seer_automation_handoff_target", ALIAS_TO_CODING_AGENT.get(agent, agent)
+                "sentry:seer_automation_handoff_target",
+                CODING_AGENT_ALIAS_TO_HANDOFF_TARGET.get(agent, agent),
             )
             project.update_option("sentry:seer_automation_handoff_integration_id", integration_id)
 
