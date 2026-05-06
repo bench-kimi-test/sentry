@@ -16,6 +16,7 @@ import {DiscoverDatasets} from 'sentry/utils/discover/types';
 import {parseLinkHeader} from 'sentry/utils/parseLinkHeader';
 import {useLocation} from 'sentry/utils/useLocation';
 import {useOrganization} from 'sentry/utils/useOrganization';
+import {combineSearches} from 'sentry/views/explore/combineSearches';
 import {
   useLogsAutoRefresh,
   useLogsAutoRefreshEnabled,
@@ -99,10 +100,7 @@ function useLogsApiOptions({
   const groupBys = useQueryParamsGroupBys();
   const [caseInsensitive] = useCaseInsensitivity();
 
-  const search = baseSearch ? _search.copy() : _search;
-  if (baseSearch) {
-    search.tokens.push(...baseSearch.tokens);
-  }
+  const search = combineSearches(_search, baseSearch);
   const fields = Array.from(
     new Set([...AlwaysPresentLogFields, ..._fields, ...groupBys.filter(Boolean)])
   );

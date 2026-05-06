@@ -9,6 +9,7 @@ import {intervalToMilliseconds} from 'sentry/utils/duration/intervalToMillisecon
 import {useApiQuery, type ApiQueryKey} from 'sentry/utils/queryClient';
 import {useLocation} from 'sentry/utils/useLocation';
 import {useOrganization} from 'sentry/utils/useOrganization';
+import {combineSearches} from 'sentry/views/explore/combineSearches';
 import {formatSort} from 'sentry/views/explore/contexts/pageParamsContext/sortBys';
 import type {RPCQueryExtras} from 'sentry/views/explore/hooks/useProgressiveQuery';
 import {
@@ -91,11 +92,7 @@ function useMetricsQueryKey({
     [fields]
   );
   const queryString = useMemo(() => {
-    const newSearch = userSearch.copy();
-
-    if (frozenSearch) {
-      newSearch.tokens.push(...frozenSearch.tokens);
-    }
+    const newSearch = combineSearches(userSearch, frozenSearch);
 
     if (traceMetric) {
       newSearch.addFilterValue(TraceMetricKnownFieldKey.METRIC_NAME, traceMetric.name);

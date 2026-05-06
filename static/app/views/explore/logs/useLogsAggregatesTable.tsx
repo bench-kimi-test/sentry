@@ -8,6 +8,7 @@ import {apiOptions, selectJsonWithHeaders} from 'sentry/utils/api/apiOptions';
 import {DiscoverDatasets} from 'sentry/utils/discover/types';
 import {useLocation} from 'sentry/utils/useLocation';
 import {useOrganization} from 'sentry/utils/useOrganization';
+import {combineSearches} from 'sentry/views/explore/combineSearches';
 import {
   useProgressiveQuery,
   type RPCQueryExtras,
@@ -126,10 +127,7 @@ function useLogsAggregatesApiOptions({
   fields.push(...groupBys.filter(Boolean));
   fields.push(...visualizes.map(visualize => visualize.yAxis));
 
-  const search = baseSearch ? _search.copy() : _search;
-  if (baseSearch) {
-    search.tokens.push(...baseSearch.tokens);
-  }
+  const search = combineSearches(_search, baseSearch);
   const pageFilters = selection;
   const dataset = DiscoverDatasets.OURLOGS;
 
